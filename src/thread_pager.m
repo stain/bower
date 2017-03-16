@@ -2672,7 +2672,7 @@ draw_sep(Attrs, Cols, MaybeSepPanel, !IO) :-
         MaybeSepPanel = yes(Panel),
         panel.erase(Panel, !IO),
         attr(Panel, Attrs ^ t_status ^ bar, !IO),
-        hline(Panel, char.to_int('-'), Cols, !IO)
+        hline(Panel, char.to_int('―'), Cols, !IO)
     ;
         MaybeSepPanel = no
     ).
@@ -2696,10 +2696,10 @@ draw_thread_line(TAttrs, Panel, Line, _LineNr, IsCursor, !IO) :-
 
     (
         Selected = selected,
-        mattr_draw(Panel, unless(IsCursor, Attrs ^ selected), "*", !IO)
+        mattr_draw(Panel, unless(IsCursor, Attrs ^ selected), " ✓", !IO)
     ;
         Selected = not_selected,
-        draw(Panel, " ", !IO)
+        draw(Panel, "  ", !IO)
     ),
     mattr(Panel, unless(IsCursor, Attrs ^ standard_tag), !IO),
 
