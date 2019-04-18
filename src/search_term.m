@@ -9,20 +9,20 @@
 :- import_module list.
 :- import_module maybe.
 
+:- import_module notmuch_config.
 :- import_module prog_config.
 
 %-----------------------------------------------------------------------------%
 
 :- type token.
 
-:- pred predigest_search_string(prog_config::in, string::in,
-    maybe_error(list(token))::out, io::di, io::uo) is det.
+:- pred predigest_search_string(prog_config::in, maybe(notmuch_config)::in,
+    string::in, maybe_error(list(token))::out, io::di, io::uo) is det.
 
 :- pred tokens_to_search_terms(list(token)::in, string::out, bool::out,
     io::di, io::uo) is det.
 
-:- pred get_default_search_terms(prog_config::in, string::out, io::di, io::uo)
-    is det.
+:- pred get_default_search_terms(notmuch_config::in, string::out) is det.
 
 :- func search_alias_section = string.
 
@@ -37,8 +37,6 @@
 :- import_module require.
 :- import_module set.
 :- import_module string.
-
-:- import_module callout.
 
 :- type token
     --->    literal(string)             % pass through to notmuch
@@ -56,14 +54,34 @@
 
 %-----------------------------------------------------------------------------%
 
-predigest_search_string(Config, Input, Res, !IO) :-
+predigest_search_string(Config, MaybeNotmuchConfig, Input, Res, !IO) :-
     promise_equivalent_solutions [ParseResult] (
         parsing_utils.parse(Input, tokens, ParseResult)
     ),
     (
         ParseResult = ok(Tokens0),
-        Seen = set.init,
-        expand_config_aliases(Config, Seen, Tokens0, Res, !IO)
+        ( contains_macro(Tokens0) ->
+            % At startup, use the notmuch config result we have got already.
+            % Subsequently, call notmuch config afresh in case the user
+            % modified the configuration.
+            (
+                MaybeNotmuchConfig = yes(NotmuchConfig0),
+                ResConfig = ok(NotmuchConfig0)
+            ;
+                MaybeNotmuchConfig = no,
+                get_notmuch_command(Config, Notmuch),
+                get_notmuch_config(Notmuch, ResConfig, !IO)
+            )
+        ;
+            ResConfig = ok(empty_notmuch_config)
+        ),
+        (
+            ResConfig = ok(NotmuchConfig),
+            expand_config_aliases(NotmuchConfig, set.init, Tokens0, Res)
+        ;
+            ResConfig = error(Error),
+            Res = error(io.error_message(Error))
+        )
     ;
         ParseResult = error(_MaybeError, _Line, _Column),
         Res = error("Error parsing search string.")
@@ -195,19 +213,41 @@ simple_alias("~A", do_not_apply_limit).
 
 %-----------------------------------------------------------------------------%
 
-:- pred expand_config_aliases(prog_config::in, set(string)::in,
-    list(token)::in, maybe_error(list(token))::out, io::di, io::uo) is det.
+:- pred contains_macro(list(token)::in) is semidet.
 
-expand_config_aliases(Config, Seen, Tokens0, Res, !IO) :-
+contains_macro(Tokens) :-
+    list.member(Token, Tokens),
+    token_is_macro(Token).
+
+:- pred token_is_macro(token::in) is semidet.
+
+token_is_macro(Token) :-
+    require_complete_switch [Token]
+    (
+        Token = macro(_)
+    ;
+        ( Token = literal(_)
+        ; Token = date_range(_, _)
+        ; Token = do_not_apply_limit
+        ),
+        fail
+    ).
+
+%-----------------------------------------------------------------------------%
+
+:- pred expand_config_aliases(notmuch_config::in, set(string)::in,
+    list(token)::in, maybe_error(list(token))::out) is det.
+
+expand_config_aliases(NotmuchConfig, Seen, Tokens0, Res) :-
     (
         Tokens0 = [],
         Res = ok([])
     ;
         Tokens0 = [H0 | T0],
-        expand_config_alias(Config, Seen, H0, ResH, !IO),
+        expand_config_alias(NotmuchConfig, Seen, H0, ResH),
         (
             ResH = ok(H),
-            expand_config_aliases(Config, Seen, T0, ResT, !IO),
+            expand_config_aliases(NotmuchConfig, Seen, T0, ResT),
             (
                 ResT = ok(T),
                 Res = ok(H ++ T)
@@ -221,13 +261,13 @@ expand_config_aliases(Config, Seen, Tokens0, Res, !IO) :-
         )
     ).
 
-:- pred expand_config_alias(prog_config::in, set(string)::in,
-    token::in, maybe_error(list(token))::out, io::di, io::uo) is det.
+:- pred expand_config_alias(notmuch_config::in, set(string)::in, token::in,
+    maybe_error(list(token))::out) is det.
 
-expand_config_alias(Config, Seen, Token0, Res, !IO) :-
+expand_config_alias(NotmuchConfig, Seen, Token0, Res) :-
     (
         Token0 = macro(Word0),
-        expand_config_alias_macro(Config, Seen, Token0, Res1, !IO),
+        expand_config_alias_macro(NotmuchConfig, Seen, Token0, Res1),
         (
             Res1 = found(Tokens),
             Res = ok(Tokens)
@@ -246,24 +286,24 @@ expand_config_alias(Config, Seen, Token0, Res, !IO) :-
         Res = ok([Token0])
     ).
 
-:- pred expand_config_alias_macro(prog_config::in, set(string)::in,
-    token::in(macro), expand_alias_result::out, io::di, io::uo) is det.
+:- pred expand_config_alias_macro(notmuch_config::in, set(string)::in,
+    token::in(macro), expand_alias_result::out) is det.
 
-expand_config_alias_macro(Config, Seen0, macro(MacroName), Res, !IO) :-
+expand_config_alias_macro(NotmuchConfig, Seen0, macro(MacroName), Res) :-
     (
-        string.remove_prefix("~", MacroName, Key),
-        not set.contains(Seen0, Key)
+        string.remove_prefix("~", MacroName, Name),
+        not set.contains(Seen0, Name)
     ->
-        get_notmuch_config(Config, search_alias_section, Key, ConfigRes, !IO),
         (
-            ConfigRes = ok(Expansion),
-            set.insert(Key, Seen0, Seen),
+            search(NotmuchConfig, search_alias_section, Name, Expansion)
+        ->
+            set.insert(Name, Seen0, Seen),
             promise_equivalent_solutions [ParseResult] (
                 parsing_utils.parse(Expansion, tokens, ParseResult)
             ),
             (
                 ParseResult = ok(Tokens0),
-                expand_config_aliases(Config, Seen, Tokens0, Res1, !IO),
+                expand_config_aliases(NotmuchConfig, Seen, Tokens0, Res1),
                 (
                     Res1 = ok(Tokens1),
                     Tokens = [literal("(")] ++ Tokens1 ++ [literal(")")],
@@ -277,8 +317,10 @@ expand_config_alias_macro(Config, Seen0, macro(MacroName), Res, !IO) :-
                 Res = error("Error parsing expansion of " ++ MacroName ++ ".")
             )
         ;
-            ConfigRes = error(_Error),
-            % XXX Distinguish different types of errors.
+            contains(NotmuchConfig, "query", Name)
+        ->
+            Res = found([literal("query:" ++ Name)])
+        ;
             Res = error("Could not expand " ++ MacroName ++ ".")
         )
     ;
@@ -317,10 +359,9 @@ token_to_search_term(Token, Term, !IO) :-
 
 %-----------------------------------------------------------------------------%
 
-get_default_search_terms(Config, Terms, !IO) :-
-    get_notmuch_config(Config, search_alias_section, "default", Res, !IO),
+get_default_search_terms(Config, Terms) :-
     (
-        Res = ok(Value),
+        search(Config, search_alias_section, "default", Value),
         Value \= ""
     ->
         Terms = Value

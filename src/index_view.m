@@ -7,14 +7,15 @@
 :- import_module io.
 
 :- import_module crypto.
+:- import_module notmuch_config.
 :- import_module prog_config.
 :- import_module screen.
 :- import_module view_common.
 
 %-----------------------------------------------------------------------------%
 
-:- pred open_index(prog_config::in, crypto::in, screen::in, string::in,
-    common_history::in, io::di, io::uo) is det.
+:- pred open_index(prog_config::in, notmuch_config::in, crypto::in, screen::in,
+    string::in, common_history::in, io::di, io::uo) is det.
 
 %-----------------------------------------------------------------------------%
 %-----------------------------------------------------------------------------%
@@ -43,8 +44,8 @@
 :- import_module curs.
 :- import_module curs.panel.
 :- import_module data.
+:- import_module pipe_to.
 :- import_module poll_notify.
-:- import_module quote_arg.
 :- import_module recall.
 :- import_module scrollable.
 :- import_module search_term.
@@ -121,13 +122,14 @@
     ;       toggle_select
     ;       unselect_all
     ;       bulk_tag(keep_selection)
+    ;       pipe_thread_id
     ;       quit.
 
 :- type action
     --->    continue
     ;       continue_no_draw
     ;       resize
-    ;       open_pager(thread_id)
+    ;       open_pager(thread_id, set(tag))
     ;       enter_limit(maybe(string))
     ;       refresh_all
     ;       start_compose
@@ -142,6 +144,7 @@
     ;       unset_deleted
     ;       prompt_tag(string)
     ;       bulk_tag(keep_selection)
+    ;       pipe_thread_id
     ;       quit.
 
 :- type keep_selection
@@ -167,13 +170,15 @@
 
 %-----------------------------------------------------------------------------%
 
-open_index(Config, Crypto, Screen, SearchString, !.CommonHistory, !IO) :-
+open_index(Config, NotmuchConfig, Crypto, Screen, SearchString,
+        !.CommonHistory, !IO) :-
     current_timestamp(Time, !IO),
     ( SearchString = "" ->
         SearchTokens = [],
         Threads = []
     ;
-        predigest_search_string(Config, SearchString, ParseRes, !IO),
+        predigest_search_string(Config, yes(NotmuchConfig), SearchString,
+            ParseRes, !IO),
         (
             ParseRes = ok(SearchTokens),
             search_terms_with_progress(Config, Screen, SearchTokens,
@@ -329,7 +334,7 @@ index_loop(Screen, OnEntry, !.IndexInfo, !IO) :-
         recreate_screen(NewScreen, !IndexInfo),
         index_loop(NewScreen, redraw, !.IndexInfo, !IO)
     ;
-        Action = open_pager(ThreadId),
+        Action = open_pager(ThreadId, IncludeTags),
         flush_async_with_progress(Screen, !IO),
         Config = !.IndexInfo ^ i_config,
         Crypto = !.IndexInfo ^ i_crypto,
@@ -344,8 +349,9 @@ index_loop(Screen, OnEntry, !.IndexInfo, !IO) :-
         ;
             MaybeSearch = no
         ),
-        open_thread_pager(Config, Crypto, Screen, ThreadId, IndexPollTerms,
-            MaybeSearch, Transition, CommonHistory0, CommonHistory, !IO),
+        open_thread_pager(Config, Crypto, Screen, ThreadId, IncludeTags,
+            IndexPollTerms, MaybeSearch, Transition,
+            CommonHistory0, CommonHistory, !IO),
         handle_screen_transition(Screen, NewScreen, Transition,
             TagUpdates, !IndexInfo, !IO),
         effect_thread_pager_changes(TagUpdates, !IndexInfo, !IO),
@@ -363,8 +369,7 @@ index_loop(Screen, OnEntry, !.IndexInfo, !IO) :-
             choose_text_initial(History0, "", Initial),
             FirstTime = yes
         ),
-        Completion = complete_limit(Config, search_alias_section,
-            ["tag:", "+tag:", "-tag:", "is:", "+is:", "-is:"]),
+        Completion = complete_limit(Config, search_alias_section),
         text_entry_full(Screen, "Limit to messages matching: ", History0,
             Initial, Completion, FirstTime, Return, !IO),
         (
@@ -372,7 +377,7 @@ index_loop(Screen, OnEntry, !.IndexInfo, !IO) :-
             add_history_nodup(LimitString, History0, History),
             !IndexInfo ^ i_common_history ^ ch_limit_history := History,
             current_timestamp(Time, !IO),
-            predigest_search_string(Config, LimitString, ParseRes, !IO),
+            predigest_search_string(Config, no, LimitString, ParseRes, !IO),
             (
                 ParseRes = ok(Tokens),
                 search_terms_with_progress(Config, Screen, Tokens,
@@ -491,6 +496,10 @@ index_loop(Screen, OnEntry, !.IndexInfo, !IO) :-
         ;
             true
         ),
+        index_loop(Screen, redraw, !.IndexInfo, !IO)
+    ;
+        Action = pipe_thread_id,
+        pipe_thread_id(Screen, !IndexInfo, !IO),
         index_loop(Screen, redraw, !.IndexInfo, !IO)
     ;
         Action = quit,
@@ -627,6 +636,10 @@ index_view_input(Screen, KeyCode, MessageUpdate, Action, !IndexInfo) :-
             MessageUpdate = no_change,
             Action = bulk_tag(KeepSelection)
         ;
+            Binding = pipe_thread_id,
+            MessageUpdate = no_change,
+            Action = pipe_thread_id
+        ;
             Binding = quit,
             MessageUpdate = no_change,
             Action = quit
@@ -697,6 +710,7 @@ key_binding_char('t', toggle_select).
 key_binding_char('T', unselect_all).
 key_binding_char('''', bulk_tag(clear_selection)).
 key_binding_char('"', bulk_tag(keep_selection)).
+key_binding_char('|', pipe_thread_id).
 key_binding_char('q', quit).
 
 :- pred move_cursor(screen::in, int::in, message_update::out,
@@ -757,7 +771,8 @@ enter(Info, Action) :-
     Scrollable = Info ^ i_scrollable,
     ( get_cursor_line(Scrollable, _, CursorLine) ->
         ThreadId = CursorLine ^ i_id,
-        Action = open_pager(ThreadId)
+        IncludeTags = CursorLine ^ i_tags,
+        Action = open_pager(ThreadId, IncludeTags)
     ;
         Action = continue
     ).
@@ -889,7 +904,7 @@ handle_recall(!Screen, Sent, !IndexInfo, !IO) :-
             handle_screen_transition(!Screen, TransitionB, Sent, !IndexInfo,
                 !IO)
         ;
-            Message = excluded_message(_),
+            Message = excluded_message(_, _, _, _, _),
             Sent = not_sent
         )
     ;
@@ -1517,6 +1532,69 @@ async_tag_attempts = 3.
 
 %-----------------------------------------------------------------------------%
 
+:- pred pipe_thread_id(screen::in, index_info::in, index_info::out,
+    io::di, io::uo) is det.
+
+pipe_thread_id(Screen, !Info, !IO) :-
+    get_selected_or_current_thread_ids(!.Info, HaveSelectedThreads, ThreadIds),
+    (
+        HaveSelectedThreads = no,
+        PromptCommand = "Pipe current thread ID: "
+    ;
+        HaveSelectedThreads = yes,
+        PromptCommand = "Pipe selected thread IDs: "
+    ),
+    (
+        ThreadIds = [],
+        MessageUpdate = set_warning("No thread.")
+    ;
+        ThreadIds = [_ | _],
+        IdStrings = map(thread_id_to_search_term, ThreadIds),
+        pipe_thread_id_2(Screen, PromptCommand, IdStrings, MessageUpdate,
+            !Info, !IO)
+    ),
+    update_message(Screen, MessageUpdate, !IO).
+
+:- pred pipe_thread_id_2(screen::in, string::in, list(string)::in,
+    message_update::out, index_info::in, index_info::out, io::di, io::uo)
+    is det.
+
+pipe_thread_id_2(Screen, PromptCommand, Strings, MessageUpdate, !Info, !IO) :-
+    History0 = !.Info ^ i_common_history ^ ch_pipe_id_history,
+    prompt_and_pipe_to_command(Screen, PromptCommand, Strings, MessageUpdate,
+        History0, History, !IO),
+    !Info ^ i_common_history ^ ch_pipe_id_history := History.
+
+:- pred get_selected_or_current_thread_ids(index_info::in, bool::out,
+    list(thread_id)::out) is det.
+
+get_selected_or_current_thread_ids(Info, Selected, ThreadIds) :-
+    Scrollable = Info ^ i_scrollable,
+    Lines = get_lines_list(Scrollable),
+    (
+        list.filter_map(selected_line_thread_id, Lines, SelectedThreadIds),
+        SelectedThreadIds \= []
+    ->
+        Selected = yes,
+        ThreadIds = SelectedThreadIds
+    ;
+        Selected = no,
+        ( get_cursor_line(Scrollable, _Cursor, CursorLine) ->
+            ThreadId = CursorLine ^ i_id,
+            ThreadIds = [ThreadId]
+        ;
+            ThreadIds = []
+        )
+    ).
+
+:- pred selected_line_thread_id(index_line::in, thread_id::out) is semidet.
+
+selected_line_thread_id(Line, ThreadId) :-
+    Line ^ i_selected = selected,
+    ThreadId = Line ^ i_id.
+
+%-----------------------------------------------------------------------------%
+
 :- pred refresh_all(screen::in, verbosity::in, index_info::in, index_info::out,
     io::di, io::uo) is det.
 
@@ -1527,7 +1605,7 @@ refresh_all(Screen, Verbose, !Info, !IO) :-
     % refresh, so expand the search terms from the beginning.
     Config = !.Info ^ i_config,
     Terms = !.Info ^ i_search_terms,
-    predigest_search_string(Config, Terms, ParseRes, !IO),
+    predigest_search_string(Config, no, Terms, ParseRes, !IO),
     (
         ParseRes = ok(Tokens),
         (
@@ -1746,14 +1824,27 @@ next_poll_time(Config, Time) = NextPollTime :-
 draw_index_view(Screen, Info, !IO) :-
     Config = Info ^ i_config,
     Attrs = index_attrs(Config),
-    Scrollable = Info ^ i_scrollable,
+    get_cols(Screen, Cols),
+    get_author_width(Cols, AuthorWidth),
     get_main_panels(Screen, MainPanels),
-    scrollable.draw(draw_index_line(Attrs), MainPanels, Scrollable, !IO).
+    Scrollable = Info ^ i_scrollable,
+    scrollable.draw(draw_index_line(Attrs, AuthorWidth), MainPanels,
+        Scrollable, !IO).
 
-:- pred draw_index_line(index_attrs::in, panel::in, index_line::in, int::in,
-    bool::in, io::di, io::uo) is det.
+:- pred get_author_width(int::in, int::out) is det.
 
-draw_index_line(IAttrs, Panel, Line, _LineNr, IsCursor, !IO) :-
+get_author_width(Cols, AuthorWidth) :-
+    Rem = Cols - 16 - 40,
+    ( Rem < 4 ->
+        AuthorWidth = 0
+    ;
+        AuthorWidth = min(Rem, 20)
+    ).
+
+:- pred draw_index_line(index_attrs::in, int::in, panel::in, index_line::in,
+    int::in, bool::in, io::di, io::uo) is det.
+
+draw_index_line(IAttrs, AuthorWidth, Panel, Line, _LineNr, IsCursor, !IO) :-
     Line = index_line(_Id, Selected, Date, Authors, Subject, Tags, StdTags,
         NonstdTagsWidth, Matched, Total),
     Attrs = IAttrs ^ i_generic,
@@ -1807,8 +1898,12 @@ draw_index_line(IAttrs, Panel, Line, _LineNr, IsCursor, !IO) :-
         draw(Panel, "  ", !IO)
     ),
 
-    mattr_draw_fixed(Panel, unless(IsCursor, Attrs ^ author + Base),
-        25, Authors, ' ', !IO),
+    ( AuthorWidth > 0 ->
+        mattr_draw_fixed(Panel, unless(IsCursor, Attrs ^ author + Base),
+            AuthorWidth, Authors, ' ', !IO)
+    ;
+        true
+    ),
 
     ( Matched = Total ->
         CountStr = format(" %3d     ", [i(Total)])

@@ -21,7 +21,7 @@
 
 :- type thread_pager_effects
     --->    thread_pager_effects(
-                % Set of tags for the thread.
+                % Set of tags for the thread (non-excluded messages only).
                 thread_tags     :: set(tag),
 
                 % Tag changes to be applied to messages.
@@ -32,7 +32,7 @@
             ).
 
 :- pred open_thread_pager(prog_config::in, crypto::in, screen::in,
-    thread_id::in, list(string)::in, maybe(string)::in,
+    thread_id::in, set(tag)::in, list(string)::in, maybe(string)::in,
     screen_transition(thread_pager_effects)::out,
     common_history::in, common_history::out, io::di, io::uo) is det.
 
@@ -65,6 +65,7 @@
 :- import_module mime_type.
 :- import_module pager.
 :- import_module path_expand.
+:- import_module pipe_to.
 :- import_module poll_notify.
 :- import_module quote_arg.
 :- import_module recall.
@@ -83,6 +84,7 @@
                 tp_config           :: prog_config,
                 tp_crypto           :: crypto,
                 tp_thread_id        :: thread_id,
+                tp_include_tags     :: set(tag),
                 tp_messages         :: list(message),
                 tp_ordering         :: ordering,
 
@@ -143,6 +145,7 @@
     ;       continue_no_draw
     ;       resize
     ;       start_reply(message, reply_kind)
+    ;       start_forward(message)
     ;       prompt_resend(message_id)
     ;       start_recall
     ;       edit_as_template(message)
@@ -157,6 +160,7 @@
     ;       toggle_content(toggle_type)
     ;       toggle_ordering
     ;       addressbook_add
+    ;       pipe_ids
     ;       refresh_results
     ;       leave.
 
@@ -179,10 +183,12 @@
 
 %-----------------------------------------------------------------------------%
 
-open_thread_pager(Config, Crypto, Screen, ThreadId, IndexPollTerms,
-        MaybeSearch, Transition, CommonHistory0, CommonHistory, !IO) :-
+open_thread_pager(Config, Crypto, Screen, ThreadId, IncludeTags,
+        IndexPollTerms, MaybeSearch, Transition, CommonHistory0, CommonHistory,
+        !IO) :-
     current_timestamp(RefreshTime, !IO),
-    get_thread_messages(Config, ThreadId, ParseResult, Messages, !IO),
+    get_thread_messages(Config, ThreadId, IncludeTags, ParseResult, Messages,
+        !IO),
 
     Ordering = ordering_threaded,
     create_pager_and_thread_lines(Config, Screen, Messages, Ordering,
@@ -196,7 +202,7 @@ open_thread_pager(Config, Crypto, Screen, ThreadId, IndexPollTerms,
     IndexPollCount = 0,
     AddedMessages0 = 0,
 
-    Info0 = thread_pager_info(Config, Crypto, ThreadId, Messages,
+    Info0 = thread_pager_info(Config, Crypto, ThreadId, IncludeTags, Messages,
         Ordering, Scrollable, NumThreadRows, PagerInfo, NumPagerRows,
         RefreshTime, NextPollTime, ThreadPollCount,
         IndexPollString, IndexPollCount,
@@ -222,7 +228,8 @@ open_thread_pager(Config, Crypto, Screen, ThreadId, IndexPollTerms,
     thread_pager_info::in, thread_pager_info::out, io::di, io::uo) is det.
 
 reopen_thread_pager(Screen, KeepCached, !Info, !IO) :-
-    !.Info = thread_pager_info(Config, _Crypto, ThreadId, Messages0, Ordering,
+    !.Info = thread_pager_info(Config, _Crypto, ThreadId, IncludeTags,
+        Messages0, Ordering,
         Scrollable0, _NumThreadRows0, Pager0, _NumPagerRows0,
         _RefreshTime0, _NextPollTime0, _ThreadPollCount0,
         _IndexPollString, _IndexPollCount,
@@ -237,7 +244,8 @@ reopen_thread_pager(Screen, KeepCached, !Info, !IO) :-
         ShowMessageUpdate = bool.no
     ;
         current_timestamp(RefreshTime, !IO),
-        get_thread_messages(Config, ThreadId, ParseResult, Messages, !IO),
+        get_thread_messages(Config, ThreadId, IncludeTags, ParseResult,
+            Messages, !IO),
         ShowMessageUpdate = bool.yes,
         !Info ^ tp_refresh_time := RefreshTime,
         !Info ^ tp_next_poll_time := next_poll_time(Config, RefreshTime),
@@ -295,12 +303,17 @@ reopen_thread_pager(Screen, KeepCached, !Info, !IO) :-
         ShowMessageUpdate = no
     ).
 
+:- func showing_num_messages(int) = string.
+
+showing_num_messages(Count) =
+    string.format("Showing %d messages.", [i(Count)]).
+
 %-----------------------------------------------------------------------------%
 
-:- pred get_thread_messages(prog_config::in, thread_id::in,
+:- pred get_thread_messages(prog_config::in, thread_id::in, set(tag)::in,
     maybe_error::out, list(message)::out, io::di, io::uo) is det.
 
-get_thread_messages(Config, ThreadId, Res, Messages, !IO) :-
+get_thread_messages(Config, ThreadId, IncludeTags, Res, Messages, !IO) :-
     get_decrypt_by_default(Config, DecryptByDefault),
     get_verify_by_default(Config, VerifyByDefault),
     (
@@ -313,15 +326,21 @@ get_thread_messages(Config, ThreadId, Res, Messages, !IO) :-
         RedirectStderr = no_redirect,
         SuspendCurs = no_suspend_curses
     ),
+
+    get_exclude_tags(Config, ExcludeTags0),
+    set.difference(ExcludeTags0, IncludeTags, ExcludeTags),
+
+    % Pass --exclude=false so that we can decide for ourselves if a message
+    % should be excluded.
     run_notmuch(Config,
         [
-            "show", "--format=json", "--entire-thread=false",
-            decrypt_arg(DecryptByDefault),
+            "show", "--format=json", "--entire-thread=true", "--exclude=false",
+            decrypt_arg_bool(DecryptByDefault),
             verify_arg(VerifyByDefault),
             "--", thread_id_to_search_term(ThreadId)
         ],
         RedirectStderr, SuspendCurs,
-        parse_messages_list, ParseResult, !IO),
+        parse_messages_list(yes(ExcludeTags)), ParseResult, !IO),
     (
         ParseResult = ok(Messages),
         Res = ok
@@ -331,20 +350,20 @@ get_thread_messages(Config, ThreadId, Res, Messages, !IO) :-
         Messages = []
     ).
 
-:- func decrypt_arg(bool) = string.
+:- func decrypt_arg(maybe_decrypted) = string.
 
-decrypt_arg(yes) = "--decrypt".
-decrypt_arg(no) = "--decrypt=false".
+decrypt_arg(is_decrypted) = decrypt_arg_bool(yes).
+decrypt_arg(not_decrypted) = decrypt_arg_bool(no).
+
+:- func decrypt_arg_bool(bool) = string.
+
+decrypt_arg_bool(yes) = "--decrypt".
+decrypt_arg_bool(no) = "--decrypt=false".
 
 :- func verify_arg(bool) = string.
 
 verify_arg(yes) = "--verify".
 verify_arg(no) = "--verify=false".
-
-:- func showing_num_messages(int) = string.
-
-showing_num_messages(Count) =
-    string.format("Showing %d messages.", [i(Count)]).
 
 %-----------------------------------------------------------------------------%
 
@@ -372,13 +391,17 @@ create_pager_and_thread_lines(Config, Screen, Messages, Ordering,
     ),
     Scrollable0 = scrollable.init_with_cursor(ThreadLines),
     compute_num_rows(Rows, Scrollable0, NumThreadRows, NumPagerRows),
+    list.filter(not_excluded_thread_line, ThreadLines, NonExcludedThreadLines),
     (
-        ThreadLines = [],
+        NonExcludedThreadLines = [],
         Scrollable = Scrollable0,
         PagerInfo = PagerInfo0
     ;
-        ThreadLines = [FirstLine | RestLines],
-        ( list.find_first_match(is_unread_line, ThreadLines, UnreadLine) ->
+        NonExcludedThreadLines = [FirstLine | RestLines],
+        (
+            list.find_first_match(is_unread_and_not_excluded,
+                NonExcludedThreadLines, UnreadLine)
+        ->
             CursorLine = UnreadLine
         ;
             list.foldl(get_latest_line, RestLines, FirstLine, LatestLine),
@@ -390,18 +413,23 @@ create_pager_and_thread_lines(Config, Screen, Messages, Ordering,
             goto_message(MessageId, NumThreadRows, Scrollable0, Scrollable),
             pager.skip_to_message(MessageId, PagerInfo0, PagerInfo)
         ;
-            Message = excluded_message(_),
+            Message = excluded_message(_, _, _, _, _),
             Scrollable = Scrollable0,
             PagerInfo = PagerInfo0
         )
     ).
 
+:- pred not_excluded_thread_line(thread_line::in) is semidet.
+
+not_excluded_thread_line(Line) :-
+    non_excluded_message(Line ^ tp_message).
+
 :- pred get_latest_line(thread_line::in, thread_line::in, thread_line::out)
     is det.
 
 get_latest_line(LineA, LineB, Line) :-
-    TimestampA = get_timestamp_fallback(LineA ^ tp_message),
-    TimestampB = get_timestamp_fallback(LineB ^ tp_message),
+    TimestampA = get_timestamp_or_zero(LineA ^ tp_message),
+    TimestampB = get_timestamp_or_zero(LineB ^ tp_message),
     ( TimestampA - TimestampB >= 0.0 ->
         Line = LineA
     ;
@@ -445,24 +473,23 @@ max_thread_lines = 8.
     list(thread_line)::out, io::di, io::uo) is det.
 
 append_threaded_messages(Nowish, Messages, ThreadLines, !IO) :-
-    PrevSubject = decoded_unstructured(""),
-    append_threaded_messages(Nowish, [], [], no, Messages, PrevSubject,
+    append_threaded_messages(Nowish, [], [], no, Messages, no,
         cord.init, ThreadCord, !IO),
     ThreadLines = list(ThreadCord).
 
 :- pred append_threaded_messages(tm::in, list(graphic)::in, list(graphic)::in,
-    maybe(message_id)::in, list(message)::in, header_value::in,
+    maybe(message_id)::in, list(message)::in, maybe(header_value)::in,
     cord(thread_line)::in, cord(thread_line)::out, io::di, io::uo) is det.
 
 append_threaded_messages(_Nowish, _Above, _Below, _MaybeParentId,
-        [], _PrevSubject, !Cord, !IO).
+        [], _MaybePrevSubject, !Cord, !IO).
 append_threaded_messages(Nowish, Above0, Below0, MaybeParentId,
-        [Message | Messages], PrevSubject, !Cord, !IO) :-
+        [Message | Messages], MaybePrevSubject, !Cord, !IO) :-
     (
         Messages = [],
         Graphics = Above0 ++ [ell],
         make_thread_line(Nowish, Message, MaybeParentId, yes(Graphics),
-            PrevSubject, Line, !IO),
+            MaybePrevSubject, Line, !IO),
         cord_util.snoc(Line, !Cord),
         MessagesCord = cord.empty,
         Below1 = Below0
@@ -470,9 +497,9 @@ append_threaded_messages(Nowish, Above0, Below0, MaybeParentId,
         Messages = [_ | _],
         Graphics = Above0 ++ [tee],
         make_thread_line(Nowish, Message, MaybeParentId, yes(Graphics),
-            PrevSubject, Line, !IO),
+            MaybePrevSubject, Line, !IO),
         cord_util.snoc(Line, !Cord),
-        get_last_subject(Message, LastSubject),
+        get_maybe_last_subject(Message, LastSubject),
         append_threaded_messages(Nowish, Above0, Below0, MaybeParentId,
             Messages, LastSubject, cord.init, MessagesCord, !IO),
         ( get_first(MessagesCord, FollowingLine) ->
@@ -493,20 +520,20 @@ append_threaded_messages(Nowish, Above0, Below0, MaybeParentId,
         Above1 = Above0 ++ [blank]
     ),
     MaybeMessageId = get_maybe_message_id(Message),
-    Subject = get_subject_fallback(Message),
+    MaybeSubject = get_maybe_subject(Message),
     Replies = get_replies(Message),
     append_threaded_messages(Nowish, Above1, Below1, MaybeMessageId, Replies,
-        Subject, !Cord, !IO),
+        MaybeSubject, !Cord, !IO),
     !:Cord = !.Cord ++ MessagesCord.
 
-:- pred get_last_subject(message::in, header_value::out) is det.
+:- pred get_maybe_last_subject(message::in, maybe(header_value)::out) is det.
 
-get_last_subject(Message, LastSubject) :-
+get_maybe_last_subject(Message, MaybeLastSubject) :-
     Replies = get_replies(Message),
     ( list.last(Replies, LastReply) ->
-        get_last_subject(LastReply, LastSubject)
+        get_maybe_last_subject(LastReply, MaybeLastSubject)
     ;
-        LastSubject = get_subject_fallback(Message)
+        MaybeLastSubject = get_maybe_subject(Message)
     ).
 
 :- pred not_blank_at_column(list(graphic)::in, int::in) is semidet.
@@ -522,7 +549,7 @@ append_flat_messages(Nowish, Messages, ThreadLines, SortedFlatMessages, !IO) :-
     flatten_messages(no, Messages, [], MessagesFlat0),
     list.sort(compare_by_timestamp, MessagesFlat0, MessagesFlat),
     list.foldl3(append_flat_message(Nowish), MessagesFlat,
-        decoded_unstructured(""), _PrevSubject, [], RevThreadLines, !IO),
+        no, _MaybePrevSubject, [], RevThreadLines, !IO),
     list.reverse(RevThreadLines, ThreadLines),
     SortedFlatMessages = list.map(mf_message, MessagesFlat).
 
@@ -541,51 +568,75 @@ flatten_messages(MaybeParentId, [Message | Messages], !Acc) :-
     comparison_result::out) is det.
 
 compare_by_timestamp(A, B, Rel) :-
-    TimestampA = get_timestamp_fallback(A ^ mf_message),
-    TimestampB = get_timestamp_fallback(B ^ mf_message),
+    TimestampA = get_timestamp_or_zero(A ^ mf_message),
+    TimestampB = get_timestamp_or_zero(B ^ mf_message),
     compare(Rel, TimestampA, TimestampB).
 
-:- pred append_flat_message(tm::in, message_flat::in, header_value::in,
-    header_value::out, list(thread_line)::in, list(thread_line)::out,
+:- pred append_flat_message(tm::in, message_flat::in, maybe(header_value)::in,
+    maybe(header_value)::out, list(thread_line)::in, list(thread_line)::out,
     io::di, io::uo) is det.
 
-append_flat_message(Nowish, MessageFlat, PrevSubject, Subject, !RevAcc, !IO) :-
+append_flat_message(Nowish, MessageFlat, MaybePrevSubject, MaybeSubject,
+        !RevAcc, !IO) :-
     MessageFlat = message_flat(Message, MaybeParentId),
-    make_thread_line(Nowish, Message, MaybeParentId, no, PrevSubject, Line,
-        !IO),
-    Subject = get_subject_fallback(Message),
+    make_thread_line(Nowish, Message, MaybeParentId, no, MaybePrevSubject,
+        Line, !IO),
+    MaybeSubject = get_maybe_subject(Message),
     cons(Line, !RevAcc).
 
 :- func mf_message(message_flat) = message. % accessor
 
 :- pred make_thread_line(tm::in, message::in, maybe(message_id)::in,
-    maybe(list(graphic))::in, header_value::in, thread_line::out,
+    maybe(list(graphic))::in, maybe(header_value)::in, thread_line::out,
     io::di, io::uo) is det.
 
-make_thread_line(Nowish, Message, MaybeParentId, MaybeGraphics, PrevSubject,
-        Line, !IO) :-
+make_thread_line(Nowish, Message, MaybeParentId, MaybeGraphics,
+        MaybePrevSubject, Line, !IO) :-
     (
-        Message = message(_Id, Timestamp, Headers, Tags, _Body, _Replies),
+        Message = message(_Id, Timestamp0, Headers0, Tags0, _Body, _Replies),
+        MaybeTimestamp = yes(Timestamp0),
+        MaybeHeaders = yes(Headers0),
+        MaybeTags = yes(Tags0)
+    ;
+        Message = excluded_message(_MaybeId, MaybeTimestamp, MaybeHeaders,
+            MaybeTags, _Replies)
+    ),
+    (
+        MaybeTimestamp = yes(Timestamp),
+        localtime(Timestamp, TM, !IO),
+        make_reldate(Nowish, TM, no, RelDate)
+    ;
+        MaybeTimestamp = no,
+        RelDate = "unknown"
+    ),
+    (
+        MaybeHeaders = yes(Headers),
         From = Headers ^ h_from,
         CleanFrom = clean_email_address(header_value_string(From)),
-        Subject = Headers ^ h_subject
+        CurSubject = Headers ^ h_subject,
+        (
+            MaybePrevSubject = yes(PrevSubject),
+            canonicalise_subject(CurSubject) = canonicalise_subject(PrevSubject)
+        ->
+            MaybeSubject = no
+        ;
+            MaybeSubject = yes(CurSubject)
+        )
     ;
-        Message = excluded_message(_Replies),
-        Timestamp = get_timestamp_fallback(Message),
+        MaybeHeaders = no,
         CleanFrom = "",
-        Subject = get_subject_fallback(Message),
+        MaybeSubject = no
+    ),
+    (
+        MaybeTags = yes(Tags)
+    ;
+        MaybeTags = no,
         Tags = set.init
     ),
     get_standard_tags(Tags, StdTags, NonstdTagsWidth),
-    localtime(Timestamp, TM, !IO),
-    make_reldate(Nowish, TM, no, RelDate),
-    ( canonicalise_subject(Subject) = canonicalise_subject(PrevSubject) ->
-        MaybeSubject = no
-    ;
-        MaybeSubject = yes(Subject)
-    ),
-    Line = thread_line(Message, MaybeParentId, CleanFrom, Tags, Tags, StdTags,
-        NonstdTagsWidth, not_selected, MaybeGraphics, RelDate, MaybeSubject).
+    Line = thread_line(Message, MaybeParentId, CleanFrom,
+        Tags, Tags, StdTags, NonstdTagsWidth,
+        not_selected, MaybeGraphics, RelDate, MaybeSubject).
 
 :- func clean_email_address(string) = string.
 
@@ -642,7 +693,7 @@ create_tag_delta_map(ThreadLine, !DeltaMap) :-
             map.det_insert(MessageId, Deltas, !DeltaMap)
         )
     ;
-        Message = excluded_message(_)
+        Message = excluded_message(_, _, _, _, _)
     ).
 
 :- pred restore_tag_deltas(map(message_id, message_tag_deltas)::in,
@@ -662,7 +713,7 @@ restore_tag_deltas(DeltaMap, ThreadLine0, ThreadLine) :-
             ThreadLine = ThreadLine0
         )
     ;
-        Message = excluded_message(_),
+        Message = excluded_message(_, _, _, _, _),
         ThreadLine = ThreadLine0
     ).
 
@@ -751,9 +802,24 @@ thread_pager_loop(Screen, OnEntry, !Info, !IO) :-
             ),
             thread_pager_loop(NewScreen, redraw, !Info, !IO)
         ;
-            Message = excluded_message(_),
+            Message = excluded_message(_, _, _, _, _),
             thread_pager_loop(Screen, redraw, !Info, !IO)
         )
+    ;
+        Action = start_forward(Message),
+        (
+            Message = message(_, _, _, _, _, _),
+            flush_async_with_progress(Screen, !IO),
+            Config = !.Info ^ tp_config,
+            Crypto = !.Info ^ tp_crypto,
+            start_forward(Config, Crypto, Screen, Message, Transition, !IO),
+            handle_screen_transition(Screen, NewScreen, Transition, _Sent,
+                !Info, !IO)
+        ;
+            Message = excluded_message(_, _, _, _, _),
+            NewScreen = Screen
+        ),
+        thread_pager_loop(NewScreen, redraw, !Info, !IO)
     ;
         Action = prompt_resend(MessageId),
         flush_async_with_progress(Screen, !IO),
@@ -844,6 +910,10 @@ thread_pager_loop(Screen, OnEntry, !Info, !IO) :-
     ;
         Action = addressbook_add,
         addressbook_add(Screen, !.Info, !IO),
+        thread_pager_loop(Screen, redraw, !Info, !IO)
+    ;
+        Action = pipe_ids,
+        pipe_ids(Screen, !Info, !IO),
         thread_pager_loop(Screen, redraw, !Info, !IO)
     ;
         Action = refresh_results,
@@ -1117,6 +1187,10 @@ thread_pager_input(Key, Action, MessageUpdate, !Info) :-
     ->
         reply(!.Info, list_reply, Action, MessageUpdate)
     ;
+        Key = char('W')
+    ->
+        forward(!.Info, Action, MessageUpdate)
+    ;
         Key = char('B')
     ->
         resend(!.Info, Action, MessageUpdate)
@@ -1133,6 +1207,11 @@ thread_pager_input(Key, Action, MessageUpdate, !Info) :-
         Key = char('@')
     ->
         Action = addressbook_add,
+        MessageUpdate = no_change
+    ;
+        Key = char('|')
+    ->
+        Action = pipe_ids,
         MessageUpdate = no_change
     ;
         ( Key = code(key_resize) ->
@@ -1211,21 +1290,32 @@ goto_parent_message(MessageUpdate, !Info) :-
     Scrollable0 = !.Info ^ tp_scrollable,
     NumThreadRows = !.Info ^ tp_num_thread_rows,
     PagerInfo0 = !.Info ^ tp_pager,
-    ( get_cursor_line(Scrollable0, Cursor0, ThreadLine) ->
-        (
-            ThreadLine ^ tp_parent = yes(ParentId),
-            search_reverse(is_message(ParentId), Scrollable0, Cursor0, Cursor)
-        ->
-            set_cursor_centred(Cursor, NumThreadRows, Scrollable0, Scrollable),
-            skip_to_message(ParentId, PagerInfo0, PagerInfo),
-            !Info ^ tp_scrollable := Scrollable,
-            !Info ^ tp_pager := PagerInfo,
-            MessageUpdate = clear_message
-        ;
-            MessageUpdate = set_warning("Message has no parent.")
-        )
-    ;
+    (
+        get_cursor_line(Scrollable0, Cursor0, ThreadLine0),
+        ThreadLine0 ^ tp_parent = yes(ParentId),
+        find_non_excluded_ancestor(Scrollable0, ParentId, Cursor0, Cursor,
+            AncestorId)
+    ->
+        set_cursor_centred(Cursor, NumThreadRows, Scrollable0, Scrollable),
+        skip_to_message(AncestorId, PagerInfo0, PagerInfo),
+        !Info ^ tp_scrollable := Scrollable,
+        !Info ^ tp_pager := PagerInfo,
         MessageUpdate = clear_message
+    ;
+        MessageUpdate = set_warning("Message has no parent.")
+    ).
+
+:- pred find_non_excluded_ancestor(scrollable(thread_line)::in, message_id::in,
+    int::in, int::out, message_id::out) is semidet.
+
+find_non_excluded_ancestor(Scrollable, ParentId, !Cursor, AncestorId) :-
+    search_reverse(thread_line_has_message_id(ParentId), Scrollable, !Cursor),
+    get_line(Scrollable, !.Cursor, ThreadLine),
+    ( non_excluded_message(ThreadLine ^ tp_message) ->
+        AncestorId = ParentId
+    ;
+        ThreadLine ^ tp_parent = yes(GP),
+        find_non_excluded_ancestor(Scrollable, GP, !Cursor, AncestorId)
     ).
 
 :- pred skip_quoted_text(message_update::out,
@@ -1259,7 +1349,10 @@ sync_thread_to_pager(!Info) :-
     scrollable(thread_line)::in, scrollable(thread_line)::out) is det.
 
 goto_message(MessageId, NumThreadRows, !Scrollable) :-
-    ( search_forward(is_message(MessageId), !.Scrollable, 0, Cursor, _) ->
+    (
+        search_forward(thread_line_has_message_id(MessageId),
+            !.Scrollable, 0, Cursor, _)
+    ->
         set_cursor_centred(Cursor, NumThreadRows, !Scrollable)
     ;
         true
@@ -1274,8 +1367,8 @@ skip_to_unread(MessageUpdate, !Info) :-
     PagerInfo0 = !.Info ^ tp_pager,
     (
         get_cursor(Scrollable0, Cursor0),
-        search_forward(is_unread_line, Scrollable0, Cursor0 + 1, Cursor,
-            ThreadLine)
+        search_forward(is_unread_and_not_excluded, Scrollable0,
+            Cursor0 + 1, Cursor, ThreadLine)
     ->
         set_cursor_centred(Cursor, NumThreadRows, Scrollable0, Scrollable),
         ( MessageId = ThreadLine ^ tp_message ^ m_id ->
@@ -1290,14 +1383,21 @@ skip_to_unread(MessageUpdate, !Info) :-
         MessageUpdate = set_warning("No more unread messages.")
     ).
 
-:- pred is_message(message_id::in, thread_line::in) is semidet.
+:- pred thread_line_has_message_id(message_id::in, thread_line::in) is semidet.
 
-is_message(MessageId, Line) :-
-    Line ^ tp_message ^ m_id = MessageId.
+thread_line_has_message_id(MessageId, Line) :-
+    Message = Line ^ tp_message,
+    require_complete_switch [Message]
+    (
+        Message = message(MessageId, _, _, _, _, _)
+    ;
+        Message = excluded_message(yes(MessageId), _, _, _, _)
+    ).
 
-:- pred is_unread_line(thread_line::in) is semidet.
+:- pred is_unread_and_not_excluded(thread_line::in) is semidet.
 
-is_unread_line(Line) :-
+is_unread_and_not_excluded(Line) :-
+    non_excluded_message(Line ^ tp_message),
     Line ^ tp_std_tags ^ unread = unread.
 
 :- pred set_current_line_read(thread_pager_info::in, thread_pager_info::out)
@@ -1331,7 +1431,7 @@ mark_preceding_read(!Info) :-
 mark_preceding_read_2(LineNum, !Scrollable) :-
     (
         get_line(!.Scrollable, LineNum, Line0),
-        is_unread_line(Line0)
+        is_unread_and_not_excluded(Line0)
     ->
         set_line_read(Line0, Line),
         set_line(LineNum, Line, !Scrollable),
@@ -1407,6 +1507,8 @@ mark_all_archived(!Info) :-
 :- pred set_line_archived(thread_line::in, thread_line::out) is det.
 
 set_line_archived(!Line) :-
+    % Although this doesn't skip excluded messages, it ends up having no
+    % effect.
     Tags0 = !.Line ^ tp_curr_tags,
     set.delete_list([tag("inbox"), tag("unread")], Tags0, Tags),
     set_tags(Tags, !Line).
@@ -1824,10 +1926,11 @@ save_part(Action, MessageUpdate, !Info) :-
     thread_pager_info::in, thread_pager_info::out, io::di, io::uo) is det.
 
 prompt_save_part(Screen, Part, MaybeSubject, !Info, !IO) :-
-    Part = part(MessageId, MaybePartId, _Type, _Content, MaybePartFilename,
-        _MaybeEncoding, _MaybeLength, IsDecrypted),
+    Part = part(MessageId, MaybePartId, _Type, _MaybeContentDisposition,
+        _Content, MaybePartFilename, _MaybeContentLength, _MaybeCTE,
+        IsDecrypted),
     (
-        MaybePartFilename = yes(PartFilename)
+        MaybePartFilename = yes(filename(PartFilename))
     ;
         MaybePartFilename = no,
         MaybeSubject = yes(Subject),
@@ -1928,7 +2031,7 @@ make_save_part_initial_prompt(History, PartFilename, Initial) :-
     ).
 
 :- pred do_save_part(prog_config::in, message_id::in, maybe(int)::in,
-    bool::in, string::in, maybe_error::out, io::di, io::uo) is det.
+    maybe_decrypted::in, string::in, maybe_error::out, io::di, io::uo) is det.
 
 do_save_part(Config, MessageId, MaybePartId, IsDecrypted, FileName, Res, !IO)
         :-
@@ -2026,13 +2129,15 @@ do_open_part(Config, Screen, Part, Command, MessageUpdate, MaybeNextKey,
                 MaybeNextKey, !IO)
         ;
             (
-                ParseResult = error(yes(Error), _Line, Column)
+                ParseResult = error(yes(Error), _Line, Column),
+                Message = string.format("parse error at column %d: %s",
+                    [i(Column), s(Error)])
             ;
                 ParseResult = error(no, _Line, Column),
-                Error = "parse error"
+                Message = string.format("parse error at column %d",
+                    [i(Column)])
             ),
-            Msg = string.format("%d: %s", [i(Column), s(Error)]),
-            MessageUpdate = set_warning(Msg),
+            MessageUpdate = set_warning(Message),
             MaybeNextKey = no
         )
     ).
@@ -2043,10 +2148,11 @@ do_open_part(Config, Screen, Part, Command, MessageUpdate, MaybeNextKey,
 
 do_open_part_2(Config, Screen, Part, CommandWords, MessageUpdate, MaybeNextKey,
         !IO) :-
-    Part = part(MessageId, MaybePartId, _Type, _Content, MaybePartFileName,
-        _MaybeEncoding, _MaybeLength, IsDecrypted),
+    Part = part(MessageId, MaybePartId, _ContentType, _MaybeContentDisposition,
+        _Content, MaybePartFileName, _MaybeContentLength, _MaybeCTE,
+        IsDecrypted),
     (
-        MaybePartFileName = yes(PartFilename),
+        MaybePartFileName = yes(filename(PartFilename)),
         get_extension(PartFilename, Ext)
     ->
         make_temp_suffix(Ext, Res0, !IO)
@@ -2217,13 +2323,15 @@ do_open_url(Screen, Command, Url, MessageUpdate, !IO) :-
             )
         ;
             (
-                ParseResult = error(yes(Error), _Line, Column)
+                ParseResult = error(yes(Error), _Line, Column),
+                Message = string.format("parse error at column %d: %s",
+                    [i(Column), s(Error)])
             ;
                 ParseResult = error(no, _Line, Column),
-                Error = "parse error"
+                Message = string.format("parse error at column %d",
+                    [i(Column)])
             ),
-            Msg = string.format("%d: %s", [i(Column), s(Error)]),
-            MessageUpdate = set_warning(Msg)
+            MessageUpdate = set_warning(Message)
         )
     ).
 
@@ -2347,7 +2455,7 @@ do_decrypt_part(Screen, MessageId, PartId, MessageUpdate, !Info, !IO) :-
         ],
         redirect_stderr("/dev/null"),
         soft_suspend_curses, % Decryption may invoke pinentry-curses.
-        parse_part(MessageId, no), ParseResult, !IO),
+        parse_part(MessageId, not_decrypted), ParseResult, !IO),
     (
         ParseResult = ok(Part),
         Content = Part ^ pt_content,
@@ -2396,7 +2504,7 @@ verify_part(Screen, !Info, !IO) :-
         get_highlighted_thing(Pager, Thing),
         Thing = highlighted_part(Part, _)
     ->
-        ( Part ^ pt_type = mime_type.multipart_signed ->
+        ( Part ^ pt_content_type = mime_type.multipart_signed ->
             do_verify_part(Screen, Part, MessageUpdate, !Info, !IO)
         ;
             MessageUpdate =
@@ -2411,8 +2519,9 @@ verify_part(Screen, !Info, !IO) :-
     thread_pager_info::in, thread_pager_info::out, io::di, io::uo) is det.
 
 do_verify_part(Screen, Part0, MessageUpdate, !Info, !IO) :-
-    Part0 = part(MessageId, MaybePartId, Type, _Content0,
-        _MaybeFilename0, _MaybeEncoding0, _MaybeLength0, IsDecrypted),
+    Part0 = part(MessageId, MaybePartId, Type, _MaybeContentDisposition0,
+        _Content0, _MaybeFilename0, _MaybeContentLength, _MaybeCTE,
+        IsDecrypted),
     (
         MaybePartId = yes(PartId),
         Config = !.Info ^ tp_config,
@@ -2427,15 +2536,17 @@ do_verify_part(Screen, Part0, MessageUpdate, !Info, !IO) :-
             ],
             redirect_stderr("/dev/null"),
             soft_suspend_curses, % Decryption may invoke pinentry-curses.
-            parse_part(MessageId, no), ParseResult, !IO),
+            parse_part(MessageId, not_decrypted), ParseResult, !IO),
         (
             ParseResult = ok(Part1),
             (
-                Part1 = part(MessageId, MaybePartId, Type, Content,
-                    MaybeFilename, MaybeEncoding, MaybeLength, _IsDecrypted1)
+                Part1 = part(MessageId, MaybePartId, Type,
+                    MaybeContentDisposition, Content, MaybeFilename,
+                    MaybeContentLength, MaybeCTE, _IsDecrypted1)
             ->
-                Part = part(MessageId, MaybePartId, Type, Content,
-                    MaybeFilename, MaybeEncoding, MaybeLength, IsDecrypted),
+                Part = part(MessageId, MaybePartId, Type,
+                    MaybeContentDisposition, Content, MaybeFilename,
+                    MaybeContentLength, MaybeCTE, IsDecrypted),
 
                 Pager0 = !.Info ^ tp_pager,
                 NumRows = !.Info ^ tp_num_pager_rows,
@@ -2540,43 +2651,55 @@ toggle_ordering(!Info) :-
 get_effects(Info, Effects) :-
     Scrollable = Info ^ tp_scrollable,
     Lines = get_lines(Scrollable),
-    version_array.foldl(get_overall_tags, Lines,
+    version_array.foldl(get_non_excluded_message_tags, Lines,
         set.init, TagSet),
-    version_array.foldl(get_changed_status_messages, Lines,
-        map.init, TagGroups),
+    version_array.foldl(get_non_excluded_message_tag_delta_groups, Lines,
+        map.init, TagDeltaGroups),
     AddedMessages = Info ^ tp_added_messages,
-    Effects = thread_pager_effects(TagSet, TagGroups, AddedMessages).
+    Effects = thread_pager_effects(TagSet, TagDeltaGroups, AddedMessages).
 
-:- pred get_overall_tags(thread_line::in, set(tag)::in, set(tag)::out) is det.
+:- pred get_non_excluded_message_tags(thread_line::in,
+    set(tag)::in, set(tag)::out) is det.
 
-get_overall_tags(Line, !TagSet) :-
-    CurrTags = Line ^ tp_curr_tags,
-    set.union(CurrTags, !TagSet).
+get_non_excluded_message_tags(Line, !TagSet) :-
+    Line = thread_line(Message, _MaybeParentId, _From, _PrevTags, CurrTags,
+        _StdTags, _NonstdTagsWidth, _Selected, _Graphics, _RelDate,
+        _MaybeSubject),
+    (
+        Message = message(_, _, _, _, _, _),
+        set.union(CurrTags, !TagSet)
+    ;
+        Message = excluded_message(_, _, _, _, _)
+    ).
 
-:- pred get_changed_status_messages(thread_line::in,
+:- pred get_non_excluded_message_tag_delta_groups(thread_line::in,
     map(set(tag_delta), list(message_id))::in,
     map(set(tag_delta), list(message_id))::out) is det.
 
-get_changed_status_messages(Line, !TagGroups) :-
-    TagSet = get_tag_delta_set(Line),
+get_non_excluded_message_tag_delta_groups(Line, !TagDeltaGroups) :-
+    Line = thread_line(Message, _MaybeParentId, _From, PrevTags, CurrTags,
+        _StdTags, _NonstdTagsWidth, _Selected, _Graphics, _RelDate,
+        _MaybeSubject),
     (
-        set.non_empty(TagSet),
-        MessageId = Line ^ tp_message ^ m_id
-    ->
-        ( map.search(!.TagGroups, TagSet, Messages0) ->
-            map.det_update(TagSet, [MessageId | Messages0], !TagGroups)
+        Message = message(MessageId, _, _, _, _, _),
+        TagDeltaSet = get_tag_delta_set(PrevTags, CurrTags),
+        ( set.non_empty(TagDeltaSet) ->
+            ( map.search(!.TagDeltaGroups, TagDeltaSet, Messages0) ->
+                map.det_update(TagDeltaSet, [MessageId | Messages0],
+                    !TagDeltaGroups)
+            ;
+                map.det_insert(TagDeltaSet, [MessageId], !TagDeltaGroups)
+            )
         ;
-            map.det_insert(TagSet, [MessageId], !TagGroups)
+            true
         )
     ;
-        true
+        Message = excluded_message(_, _, _, _, _)
     ).
 
-:- func get_tag_delta_set(thread_line) = set(tag_delta).
+:- func get_tag_delta_set(set(tag), set(tag)) = set(tag_delta).
 
-get_tag_delta_set(Line) = TagDeltaSet :-
-    PrevTags = Line ^ tp_prev_tags,
-    CurrTags = Line ^ tp_curr_tags,
+get_tag_delta_set(PrevTags, CurrTags) = TagDeltaSet :-
     set.difference(CurrTags, PrevTags, AddTags),
     set.difference(PrevTags, CurrTags, RemoveTags),
     set.map(make_tag_delta("+"), AddTags) = AddTagDeltas,
@@ -2599,6 +2722,21 @@ reply(Info, ReplyKind, Action, MessageUpdate) :-
         Action = start_reply(Message, ReplyKind)
     ;
         MessageUpdate = set_warning("Nothing to reply to."),
+        Action = continue
+    ).
+
+%-----------------------------------------------------------------------------%
+
+:- pred forward(thread_pager_info::in, thread_pager_action::out,
+    message_update::out) is det.
+
+forward(Info, Action, MessageUpdate) :-
+    PagerInfo = Info ^ tp_pager,
+    ( get_top_message(PagerInfo, Message) ->
+        MessageUpdate = clear_message,
+        Action = start_forward(Message)
+    ;
+        MessageUpdate = set_warning("No message to forward."),
         Action = continue
     ).
 
@@ -2652,7 +2790,7 @@ handle_recall(!Screen, ThreadId, Sent, !Info, !IO) :-
                 Message, TransitionB, !IO),
             handle_screen_transition(!Screen, TransitionB, Sent, !Info, !IO)
         ;
-            Message = excluded_message(_),
+            Message = excluded_message(_, _, _, _, _),
             Sent = not_sent
         )
     ;
@@ -2688,7 +2826,7 @@ handle_edit_as_template(!Screen, Message, Sent, !Info, !IO) :-
             Message, Transition, !IO),
         handle_screen_transition(!Screen, Transition, Sent, !Info, !IO)
     ;
-        Message = excluded_message(_),
+        Message = excluded_message(_, _, _, _, _),
         Sent = not_sent
     ).
 
@@ -2709,6 +2847,101 @@ addressbook_add(Screen, Info, !IO) :-
         Address0 = ""
     ),
     prompt_addressbook_add(Config, Screen, Address0, !IO).
+
+%-----------------------------------------------------------------------------%
+
+:- pred pipe_ids(screen::in, thread_pager_info::in, thread_pager_info::out,
+    io::di, io::uo) is det.
+
+pipe_ids(Screen, !Info, !IO) :-
+    PromptWhat0 = "Pipe: (t) current thread ID",
+    get_selected_or_current_message_ids(!.Info, HaveSelectedMessages,
+        MessageIds),
+    (
+        HaveSelectedMessages = no,
+        PromptWhat = PromptWhat0 ++ ", (m) current message ID"
+    ;
+        HaveSelectedMessages = yes,
+        PromptWhat = PromptWhat0 ++ ", (m) selected message IDs"
+    ),
+    update_message_immed(Screen, set_prompt(PromptWhat), !IO),
+    get_keycode_blocking(KeyCode, !IO),
+    ( KeyCode = char('t') ->
+        PromptCommand = "Pipe thread ID: ",
+        ThreadId = !.Info ^ tp_thread_id,
+        IdStrings = [thread_id_to_search_term(ThreadId)],
+        pipe_ids_2(Screen, PromptCommand, IdStrings, MessageUpdate, !Info, !IO)
+    ; KeyCode = char('m') ->
+        (
+            MessageIds = [],
+            MessageUpdate = set_warning("No message.")
+        ;
+            (
+                MessageIds = [_],
+                PromptCommand = "Pipe message ID: "
+            ;
+                MessageIds = [_, _ | _],
+                PromptCommand = "Pipe message IDs: "
+            ),
+            IdStrings = map(message_id_to_search_term, MessageIds),
+            pipe_ids_2(Screen, PromptCommand, IdStrings, MessageUpdate,
+                !Info, !IO)
+        )
+    ;
+        MessageUpdate = clear_message
+    ),
+    update_message(Screen, MessageUpdate, !IO).
+
+:- pred pipe_ids_2(screen::in, string::in, list(string)::in,
+    message_update::out, thread_pager_info::in, thread_pager_info::out,
+    io::di, io::uo) is det.
+
+pipe_ids_2(Screen, PromptCommand, Strings, MessageUpdate, !Info, !IO) :-
+    History0 = !.Info ^ tp_common_history ^ ch_pipe_id_history,
+    prompt_and_pipe_to_command(Screen, PromptCommand, Strings, MessageUpdate,
+        History0, History, !IO),
+    !Info ^ tp_common_history ^ ch_pipe_id_history := History.
+
+:- pred get_selected_or_current_message_ids(thread_pager_info::in, bool::out,
+    list(message_id)::out) is det.
+
+get_selected_or_current_message_ids(Info, Selected, MessageIds) :-
+    Scrollable = Info ^ tp_scrollable,
+    Lines = get_lines_list(Scrollable),
+    (
+        list.filter_map(selected_line_message_id, Lines, SelectedMessageIds),
+        SelectedMessageIds \= []
+    ->
+        Selected = yes,
+        MessageIds = SelectedMessageIds
+    ;
+        Selected = no,
+        (
+            get_cursor_line(Scrollable, _Cursor, CursorLine),
+            thread_line_message_id(CursorLine, MessageId)
+        ->
+            MessageIds = [MessageId]
+        ;
+            MessageIds = []
+        )
+    ).
+
+:- pred selected_line_message_id(thread_line::in, message_id::out) is semidet.
+
+selected_line_message_id(Line, MessageId) :-
+    Line ^ tp_selected = selected,
+    thread_line_message_id(Line, MessageId).
+
+:- pred thread_line_message_id(thread_line::in, message_id::out) is semidet.
+
+thread_line_message_id(Line, MessageId) :-
+    Message = Line ^ tp_message,
+    require_complete_switch [Message]
+    (
+        Message = message(MessageId, _, _, _, _, _)
+    ;
+        Message = excluded_message(yes(MessageId), _, _, _, _)
+    ).
 
 %-----------------------------------------------------------------------------%
 
@@ -2841,9 +3074,8 @@ draw_sep(Attrs, Cols, MaybeSepPanel, !IO) :-
     bool::in, io::di, io::uo) is det.
 
 draw_thread_line(TAttrs, Panel, Line, _LineNr, IsCursor, !IO) :-
-    Line = thread_line(_Message, _ParentId, From, _PrevTags, CurrTags,
-        StdTags, NonstdTagsWidth, Selected, MaybeGraphics, RelDate,
-        MaybeSubject),
+    Line = thread_line(Message, _ParentId, From, _PrevTags, CurrTags, StdTags,
+        NonstdTagsWidth, Selected, MaybeGraphics, RelDate, MaybeSubject),
     Attrs = TAttrs ^ t_generic,
     (
         IsCursor = yes,
@@ -2901,6 +3133,13 @@ draw_thread_line(TAttrs, Panel, Line, _LineNr, IsCursor, !IO) :-
         MaybeGraphics = no
     ),
     draw(Panel, "• ", !IO),
+
+    (
+        Message = message(_, _, _, _, _, _)
+    ;
+        Message = excluded_message(_, _, _, _, _),
+        draw(Panel, "(excluded) ", !IO)
+    ),
 
     (
         Unread = unread,

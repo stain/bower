@@ -31,7 +31,7 @@
 :- pred setup_pager(prog_config::in, setup_mode::in, int::in,
     list(message)::in, pager_info::out, io::di, io::uo) is det.
 
-:- pred setup_pager_for_staging(int::in, string::in,
+:- pred setup_pager_for_staging(prog_config::in, int::in, string::in,
     retain_pager_pos::in, pager_info::out) is det.
 
 :- type pager_action
@@ -129,6 +129,7 @@
 :- import_module mime_type.
 :- import_module pager_text.
 :- import_module quote_arg.
+:- import_module size_util.
 :- import_module string_util.
 :- import_module time_util.
 
@@ -157,11 +158,15 @@
     --->    node_id - pager_line.
 
 :- type pager_line
-    --->    header(
-                start_message   :: maybe(message),
-                continue        :: bool,
-                name            :: string,
-                value           :: string % folded (wrapped)
+    --->    start_of_message_header(
+                som_message     :: message,
+                som_header_name :: string,
+                som_header_value :: string % folded (wrapped)
+            )
+    ;       subseq_message_header(
+                smh_continue    :: bool,
+                smh_name        :: string,
+                smh_value       :: string % folded (wrapped)
             )
     ;       text(pager_text)
     ;       part_head(
@@ -272,7 +277,8 @@ is_blank_line(Line) :-
     ;
         Line = message_separator
     ;
-        ( Line = header(_, _, _, _)
+        ( Line = start_of_message_header(_, _, _)
+        ; Line = subseq_message_header(_, _, _)
         ; Line = part_head(_, _, _, _)
         ; Line = fold_marker(_, _)
         ; Line = signature(_)
@@ -313,10 +319,32 @@ setup_pager(Config, Mode, Cols, Messages, Info, !IO) :-
     message::in, tree::out, counter::in, counter::out, io::di, io::uo) is det.
 
 make_message_tree(Config, Mode, Cols, Message, Tree, !Counter, !IO) :-
-    Headers = Message ^ m_headers,
-    counter.allocate(NodeIdInt, !Counter),
-    NodeId = node_id(NodeIdInt),
+    allocate_node_id(NodeId, !Counter),
+    (
+        Message = message(_MessageId, _Timestamp, _Headers, _Tags, _Body,
+            Replies),
+        make_message_self_trees(Config, Cols, Message, NodeId, SelfTrees,
+            !Counter, !IO)
+    ;
+        Message = excluded_message(_, _, _, _, Replies),
+        SelfTrees = []
+    ),
+    (
+        Mode = include_replies,
+        list.map_foldl2(make_message_tree(Config, Mode, Cols),
+            Replies, ReplyTrees, !Counter, !IO)
+    ;
+        Mode = toplevel_only,
+        ReplyTrees = []
+    ),
+    Tree = node(NodeId, SelfTrees ++ ReplyTrees, no).
 
+:- pred make_message_self_trees(prog_config::in, int::in, message::in(message),
+    node_id::in, list(tree)::out, counter::in, counter::out, io::di, io::uo)
+    is det.
+
+make_message_self_trees(Config, Cols, Message, NodeId, Trees, !Counter, !IO) :-
+    Message = message(_MessageId, _Timestamp, Headers, _Tags, Body, _Replies),
     some [!RevLines] (
         !:RevLines = [],
         add_header(yes(Message), Cols, "Date", Headers ^ h_date, !RevLines),
@@ -329,7 +357,6 @@ make_message_tree(Config, Mode, Cols, Message, Tree, !Counter, !IO) :-
         HeaderTree = leaf(list.reverse(!.RevLines))
     ),
 
-    Body = Message ^ m_body,
     list.map_foldl3(make_part_tree(Config, Cols), Body, BodyTrees,
         yes, _ElideInitialHeadLine, !Counter, !IO),
     BodyTree = node(NodeId, BodyTrees, no),
@@ -340,32 +367,7 @@ make_message_tree(Config, Mode, Cols, Message, Tree, !Counter, !IO) :-
         message_separator
     ]),
 
-    (
-        Mode = include_replies,
-        Replies = Message ^ m_replies,
-        list.map_foldl2(make_message_tree(Config, Mode, Cols),
-            Replies, ReplyTrees, !Counter, !IO)
-    ;
-        Mode = toplevel_only,
-        ReplyTrees = []
-    ),
-
-    SubTrees = [HeaderTree, BodyTree, Separators | ReplyTrees],
-    Tree = node(NodeId, SubTrees, no).
-
-make_message_tree(Config, Mode, Cols, Message, Tree, !Counter, !IO) :-
-    Message = excluded_message(Replies),
-    counter.allocate(NodeIdInt, !Counter),
-    NodeId = node_id(NodeIdInt),
-    (
-        Mode = include_replies,
-        list.map_foldl2(make_message_tree(Config, Mode, Cols),
-            Replies, ReplyTrees, !Counter, !IO)
-    ;
-        Mode = toplevel_only,
-        ReplyTrees = []
-    ),
-    Tree = node(NodeId, ReplyTrees, no).
+    Trees = [HeaderTree, BodyTree, Separators].
 
 :- pred add_header(maybe(message)::in, int::in, string::in, header_value::in,
     list(pager_line)::in, list(pager_line)::out) is det.
@@ -382,14 +384,21 @@ add_header(StartMessage, Cols, Name, Value, !RevLines) :-
     ;
         Folded = [FoldedHead | FoldedTail]
     ),
-    cons(header(StartMessage, no, Name, FoldedHead), !RevLines),
+    (
+        StartMessage = yes(Message),
+        Line = start_of_message_header(Message, Name, FoldedHead)
+    ;
+        StartMessage = no,
+        Line = subseq_message_header(no, Name, FoldedHead)
+    ),
+    cons(Line, !RevLines),
     foldl(add_header_cont(Name), FoldedTail, !RevLines).
 
 :- pred add_header_cont(string::in, string::in,
     list(pager_line)::in, list(pager_line)::out) is det.
 
 add_header_cont(Name, Value, !RevLines) :-
-    cons(header(no, yes, Name, Value), !RevLines).
+    cons(subseq_message_header(yes, Name, Value), !RevLines).
 
 :- pred maybe_add_header(int::in, string::in, header_value::in,
     list(pager_line)::in, list(pager_line)::out) is det.
@@ -415,8 +424,8 @@ make_part_tree(Config, Cols, Part, Tree, !ElideInitialHeadLine, !Counter, !IO)
 
 make_part_tree_with_alts(Config, Cols, AltParts, Part, HandleUnsupported, Tree,
         !ElideInitialHeadLine, !Counter, !IO) :-
-    Part = part(_MessageId, _PartId, PartType, Content, _MaybeFilename,
-        _MaybeEncoding, _MaybeLength, _IsDecrypted),
+    Part = part(_MessageId, _PartId, PartType, _MaybeContentDisposition,
+        Content, _MaybeFilename, _MaybeContentLength, _MaybeCTE, _IsDecrypted),
     allocate_node_id(PartNodeId, !Counter),
     (
         Content = text(InlineText),
@@ -433,7 +442,8 @@ make_part_tree_with_alts(Config, Cols, AltParts, Part, HandleUnsupported, Tree,
             Text = InlineText,
             Filtered = part_not_filtered
         ),
-        make_text_lines(Cols, Text, Lines0),
+        get_wrap_width(Config, Cols, WrapWidth),
+        make_text_lines(WrapWidth, Text, Lines0),
         list.map(wrap_text, Lines0) = Lines,
         fold_quote_blocks(Lines, TextTrees, !Counter),
         (
@@ -458,7 +468,8 @@ make_part_tree_with_alts(Config, Cols, AltParts, Part, HandleUnsupported, Tree,
         ->
             % Assuming Signatures = []
             make_part_tree_with_alts(Config, Cols, RestSubParts, FirstSubPart,
-                default, Tree, no, _ElideInitialHeadLine, !Counter, !IO)
+                default, Tree, no, _ElideInitialHeadLine, !Counter, !IO),
+            !:ElideInitialHeadLine = no
         ;
             get_importance(PartType, AltParts, Encryption, Signatures,
                 Importance),
@@ -640,7 +651,8 @@ is_quoted_text(Line) :-
         Line = text(pager_text(Level, _, _, _)),
         Level > 0
     ;
-        ( Line = header(_, _, _, _)
+        ( Line = start_of_message_header(_, _, _)
+        ; Line = subseq_message_header(_, _, _)
         ; Line = part_head(_, _, _, _)
         ; Line = fold_marker(_, _)
         ; Line = signature(_)
@@ -709,8 +721,9 @@ add_encapsulated_header(Header, Value, RevLines0, RevLines) :-
 
 make_unsupported_part_tree(Config, Cols, PartNodeId, Part, HandleUnsupported,
         AltParts, Tree, !IO) :-
-    Part = part(MessageId, MaybePartId, PartType, _Content, _MaybeFilename,
-        _MaybeEncoding, _MaybeLength, _IsDecrypted),
+    Part = part(MessageId, MaybePartId, PartType, _MaybeContentDisposition,
+        _Content, _MaybeFilename, _MaybeContentLength, _MaybeCTE,
+        _IsDecrypted),
     (
         HandleUnsupported = default,
         DoExpand = ( if PartType = mime_type.text_html then yes else no )
@@ -735,7 +748,8 @@ make_unsupported_part_tree(Config, Cols, PartNodeId, Part, HandleUnsupported,
             MaybeText, !IO),
         (
             MaybeText = ok(Text),
-            make_text_lines(Cols, Text, TextLines)
+            get_wrap_width(Config, Cols, WrapWidth),
+            make_text_lines(WrapWidth, Text, TextLines)
         ;
             MaybeText = error(Error),
             make_text_lines(Cols, "(" ++ Error ++ ")", TextLines)
@@ -771,8 +785,9 @@ wrap_text(Text) = text(Text).
 
 %-----------------------------------------------------------------------------%
 
-setup_pager_for_staging(Cols, Text, RetainPagerPos, Info) :-
-    make_text_lines(Cols, Text, Lines0),
+setup_pager_for_staging(Config, Cols, Text, RetainPagerPos, Info) :-
+    get_wrap_width(Config, Cols, WrapWidth),
+    make_text_lines(WrapWidth, Text, Lines0),
     Lines = wrap_texts(Lines0) ++ [
         message_separator,
         message_separator,
@@ -1042,12 +1057,12 @@ skip_quoted_text(MessageUpdate, !Info) :-
 is_quoted_text_or_message_start(_Id - Line) :-
     require_complete_switch [Line]
     (
-        Line = header(yes(_), _, _, _)
+        Line = start_of_message_header(_, _, _)
     ;
         Line = text(pager_text(Level, _, _, _)),
         Level > 0
     ;
-        ( Line = header(no, _, _, _)
+        ( Line = subseq_message_header(_, _, _)
         ; Line = part_head(_, _, _, _)
         ; Line = fold_marker(_, _)
         ; Line = signature(_)
@@ -1183,26 +1198,28 @@ id_pager_line_matches_search(Search, _Id - Line) :-
 line_matches_search(Search, Line) :-
     require_complete_switch [Line]
     (
-        Line = header(StartMessage, _Cont, _, String),
+        Line = start_of_message_header(Message, _Name, Value),
         (
-            strcase_str(String, Search)
+            strcase_str(Value, Search)
         ;
             % XXX this won't match current tags
-            StartMessage = yes(Message),
             Tags = Message ^ m_tags,
             set.member(tag(TagName), Tags),
             strcase_str(TagName, Search)
         )
+    ;
+        Line = subseq_message_header(_Continue, _Name, Value),
+        strcase_str(Value, Search)
     ;
         Line = text(pager_text(_, String, _, _)),
         strcase_str(String, Search)
     ;
         Line = part_head(Part, _, _, _),
         (
-            Part ^ pt_type = PartType,
+            Part ^ pt_content_type = PartType,
             strcase_str(to_string(PartType), Search)
         ;
-            Part ^ pt_filename = yes(FileName),
+            Part ^ pt_filename = yes(filename(FileName)),
             strcase_str(FileName, Search)
         )
     ;
@@ -1268,7 +1285,8 @@ is_highlightable_minor(_Id - Line) :-
     ;
         Line = fold_marker(_, _)
     ;
-        ( Line = header(_, _, _, _)
+        ( Line = start_of_message_header(_, _, _)
+        ; Line = subseq_message_header(_, _, _)
         ; Line = signature(_)
         ; Line = message_separator
         ),
@@ -1280,11 +1298,12 @@ is_highlightable_minor(_Id - Line) :-
 is_highlightable_major(_Id - Line) :-
     require_complete_switch [Line]
     (
-        Line = header(yes(_), _, _, _)
+        Line = start_of_message_header(_, _, _)
     ;
         Line = part_head(_, _, _, _)
     ;
-        ( Line = text(_)
+        ( Line = subseq_message_header(_, _, _)
+        ; Line = text(_)
         ; Line = fold_marker(_, _)
         ; Line = signature(_)
         ; Line = message_separator
@@ -1297,14 +1316,18 @@ get_highlighted_thing(Info, Thing) :-
     get_cursor_line(Scrollable, _, _NodeId - Line),
     require_complete_switch [Line]
     (
-        Line = header(yes(Message), _, _, _),
+        Line = start_of_message_header(Message, _, _),
         MessageId = Message ^ m_id,
         Subject = Message ^ m_headers ^ h_subject,
         PartId = 0,
-        Part = part(MessageId, yes(PartId), mime_type.text_plain, unsupported,
-            no, no, no, no),
+        % Hmm.
+        Part = part(MessageId, yes(PartId), mime_type.text_plain,
+            no, unsupported, no, no, no, not_decrypted),
         MaybeSubject = yes(Subject),
         Thing = highlighted_part(Part, MaybeSubject)
+    ;
+        Line = subseq_message_header(_, _, _),
+        fail
     ;
         Line = part_head(Part, _, _, _),
         MaybeSubject = no,
@@ -1316,9 +1339,6 @@ get_highlighted_thing(Info, Thing) :-
     ;
         Line = fold_marker(_, _),
         Thing = highlighted_fold_marker
-    ;
-        Line = header(no, _, _, _),
-        fail
     ;
         Line = signature(_),
         fail
@@ -1369,7 +1389,8 @@ toggle_line(Config, ToggleType, NumRows, Cols, NodeId - Line, MessageUpdate,
         toggle_folding(NumRows, NodeId, Line, !Info),
         MessageUpdate = clear_message
     ;
-        ( Line = header(_, _, _, _)
+        ( Line = start_of_message_header(_, _, _)
+        ; Line = subseq_message_header(_, _, _)
         ; Line = text(pager_text(_, _, _, _))
         ; Line = signature(_)
         ; Line = message_separator
@@ -1402,7 +1423,7 @@ toggle_part(Config, ToggleType, NumRows, Cols, NodeId, Line, MessageUpdate,
         scrollable.reinit(Flattened, NumRows, Scrollable0, Scrollable),
         make_extents(Flattened, Extents),
         Info = pager_info(Tree, Counter, Scrollable, Extents),
-        Type = mime_type.to_string(Part ^ pt_type),
+        Type = mime_type.to_string(Part ^ pt_content_type),
         MessageUpdate = set_info("Showing " ++ Type ++ " alternative.")
     ;
         % Fallback.
@@ -1517,10 +1538,10 @@ skip_message_lines(Lines0, Lines, LineNr0, LineNr) :-
 is_start_of_message(_NodeId - Line, Message) :-
     require_complete_switch [Line]
     (
-        Line = header(MaybeStartMessage, _Continue, _Name, _Value),
-        MaybeStartMessage = yes(Message)
+        Line = start_of_message_header(Message, _Name, _Value)
     ;
-        ( Line = text(_)
+        ( Line = subseq_message_header(_, _, _)
+        ; Line = text(_)
         ; Line = part_head(_, _, _, _)
         ; Line = fold_marker(_, _)
         ; Line = signature(_)
@@ -1534,8 +1555,10 @@ is_start_of_message(_NodeId - Line, Message) :-
 is_part_of_message(_NodeId - Line) :-
     require_complete_switch [Line]
     (
-        Line = header(MaybeStartMessage, _Continue, _Name, _Value),
-        MaybeStartMessage = no
+        Line = start_of_message_header(_, _, _),
+        fail
+    ;
+        Line = subseq_message_header(_, _, _)
     ;
         Line = text(_)
     ;
@@ -1586,7 +1609,12 @@ draw_id_pager_line(Attrs, Panel, _Id - Line, _LineNr, IsCursor, !IO) :-
 draw_pager_line(Attrs, Panel, Line, IsCursor, !IO) :-
     GAttrs = Attrs ^ p_generic,
     (
-        Line = header(_, Continue, Name, Value),
+        (
+            Line = start_of_message_header(_Message, Name, Value),
+            Continue = no
+        ;
+            Line = subseq_message_header(Continue, Name, Value)
+        ),
         attr(Panel, GAttrs ^ field_name, !IO),
         (
             Continue = no,
@@ -1643,8 +1671,9 @@ draw_pager_line(Attrs, Panel, Line, IsCursor, !IO) :-
         )
     ;
         Line = part_head(Part, HiddenParts, Expanded, Importance),
-        Part = part(_MessageId, _Part, ContentType, _Content,
-            MaybeFilename, MaybeEncoding, MaybeLength, _IsDecrypted),
+        Part = part(_MessageId, _Part, ContentType, _MaybeContentDisposition,
+            _Content, MaybeFilename, MaybeContentLength, MaybeCTE,
+            _IsDecrypted),
         (
             Importance = importance_normal,
             Attr0 = Attrs ^ p_part_head
@@ -1662,18 +1691,40 @@ draw_pager_line(Attrs, Panel, Line, IsCursor, !IO) :-
         draw(Panel, Attr, "[-- ", !IO),
         draw(Panel, mime_type.to_string(ContentType), !IO),
         (
-            MaybeFilename = yes(Filename),
+            MaybeFilename = yes(filename(Filename)),
             draw(Panel, "; ", !IO),
             draw(Panel, Filename, !IO)
         ;
             MaybeFilename = no
         ),
+        /*
         (
-            MaybeLength = yes(Length),
-            DecodedLength = decoded_length(MaybeEncoding, Length),
-            draw(Panel, format_length(DecodedLength), !IO)
+            MaybeContentDisposition = yes(content_disposition(Disposition)),
+            draw(Panel, "; ", !IO),
+            draw(Panel, Disposition, !IO)
         ;
-            MaybeLength = no
+            MaybeContentDisposition = no
+        ),
+        (
+            MaybeContentCharset = yes(content_charset(Charset)),
+            draw(Panel, "; charset=", !IO),
+            draw(Panel, Charset, !IO)
+        ;
+            MaybeContentCharset = no
+        ),
+        */
+        (
+            MaybeContentLength = yes(content_length(Length)),
+            ( estimate_decoded_length(MaybeCTE, Length, DecodedLength0) ->
+                DecodedLength = DecodedLength0
+            ;
+                DecodedLength = Length
+            ),
+            draw(Panel, " (", !IO),
+            draw(Panel, format_approx_length(DecodedLength), !IO),
+            draw(Panel, ")", !IO)
+        ;
+            MaybeContentLength = no
         ),
         draw(Panel, " --]", !IO),
         ( make_part_message(Part, HiddenParts, Expanded, Message) ->
@@ -1785,28 +1836,6 @@ diff_line_to_attr(Attrs, diff_rem) = Attrs ^ p_diff_rem.
 diff_line_to_attr(Attrs, diff_hunk) = Attrs ^ p_diff_hunk.
 diff_line_to_attr(Attrs, diff_index) = Attrs ^ p_diff_index.
 
-:- func decoded_length(maybe(string), int) = int.
-
-decoded_length(MaybeEncoding, Length) =
-    ( MaybeEncoding = yes("base64") ->
-        Length * 3 / 4
-    ;
-        Length
-    ).
-
-:- func format_length(int) = string.
-
-format_length(Size) = String :-
-    ( Size = 0 ->
-        String = " (0 bytes)"
-    ; Size =< 1000000 ->
-        Ks = float(Size) / 1000.0,
-        String = format(" (%.1f kB)", [f(Ks)])
-    ;
-        Ms = float(Size) / 1000000.0,
-        String = format(" (%.1f MB)", [f(Ms)])
-    ).
-
 :- pred make_part_message(part::in, list(part)::in, part_expanded::in,
     string::out) is semidet.
 
@@ -1857,7 +1886,7 @@ make_part_message_2(Part, HiddenParts, Expanded, Message) :-
             (
                 HiddenParts = [],
                 Signatures = [],
-                Part ^ pt_type = mime_type.multipart_signed,
+                Part ^ pt_content_type = mime_type.multipart_signed,
                 Message = "y to verify"
             ;
                 HiddenParts = [_],

@@ -158,6 +158,8 @@ The keys are:
     R               recall postponed message
     @               add to address book
 
+    |               pipe thread IDs to command
+
     q               quit
 
 Thread/pager view keys
@@ -196,6 +198,7 @@ This view pages through an entire thread.  The keys are:
     r               reply to sender
     e               reply to everyone
     L               reply to list
+    W               forward message
     B               resend message to another address ("bounce")
     E               use current message as a template for a new message
     R               recall postponed message
@@ -210,6 +213,8 @@ This view pages through an entire thread.  The keys are:
     z, o            expand/collapse folded text
     y               verify signed part
 
+    |               pipe thread or message IDs to command
+
     i, q            return to index
     I               return to index, removing 'unread' tag on all messages
     A               return to index, removing 'inbox' and 'unread' on messages
@@ -217,6 +222,12 @@ This view pages through an entire thread.  The keys are:
 The 'o' command, which opens parts and URLs, takes a command using Unix shell
 quoting syntax.  If the command ends with an unquoted '&' character then the
 command will be run in the background.
+
+Note: forward (W) and edit-as-new (E) currently will not create a proper
+message template for messages that are manually decrypted in the thread view.
+A workaround is to set `crypto.decrypt_by_default = true` in the bower
+configuration so that encrypted messages are automatically decrypted upon
+opening a thread.
 
 
 Limit command syntax extensions
@@ -252,9 +263,16 @@ Some examples:
 Search term aliases
 -------------------
 
-In addition to the built-in macros, bower will try to expand search term
-aliases written with the syntax `~WORD`.
-You can add your expansions to the notmuch config file in a section
+In addition to the built-in macros, bower will try to expand tokens of the
+form `~NAME` in two ways:
+
+  - if there is a search term alias called `NAME` then the token will
+    be replaced with its expansion
+
+  - if there is a notmuch named query called `NAME` then the token will
+    be replaced with `query:NAME`
+
+Search term aliases are defined in the notmuch config file in a section
 called `[bower:search_alias]`. Expansions may make use of other
 (non-recursive) expansions.  For example:
 
@@ -271,7 +289,15 @@ called `[bower:search_alias]`. Expansions may make use of other
 As mentioned earlier, the `~default` alias sets the initial search query
 if you run `bower` without command-line arguments.
 
-You can tab complete search term aliases.
+The differences between search term aliases and notmuch named queries are:
+
+  - search term aliases are specific to bower
+  - search term aliases may use bower-specific syntax, and refer to other
+    search term aliases
+  - named queries are stored in the notmuch database instead of the notmuch
+    config file
+
+You can tab complete search term aliases and notmuch named queries.
 
 
 Tag modification behaviour

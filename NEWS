@@ -1,8 +1,24 @@
-Bower 0.10-unreleased
+Bower 0.11-unreleased
 =====================
 
+* Add '|' key to pipe thread or message IDs to external command.
+* thread/pager: Show messages with exclude tags if the tags are explicitly
+  searched for in the index view.
+* compose: Allow non-UTF-8 "text" files to be attached by using
+  base64 transfer encoding.
+* Add ui.wrap_width option to wrap message lines before terminal width.
+
+Bower 0.10 (2019-01-26)
+=======================
+
+* thread/pager: Add 'W' key to forward message.
 * Support BOWER_CONFIG environment variable.
 * Document support for XDG Base Directory Specification.
+* Support tab expansion for query:.
+* Support ~NAME as a shorthand for query:NAME.
+* Support Shift-Tab to cycle through completions in reverse.
+* Make path completion work more smoothly.
+* Minor improvements.
 
 Bower 0.9 (2018-10-07)
 ======================

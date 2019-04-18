@@ -4,7 +4,6 @@
 :- module data.
 :- interface.
 
-:- import_module bool.
 :- import_module list.
 :- import_module map.
 :- import_module maybe.
@@ -31,15 +30,22 @@
 
 :- type message
     --->    message(
-                m_id        :: message_id,
-                m_timestamp :: timestamp,
-                m_headers   :: headers,
-                m_tags      :: set(tag),
-                m_body      :: list(part),
-                m_replies   :: list(message)
+                m_id            :: message_id,
+                m_timestamp     :: timestamp,
+                m_headers       :: headers,
+                m_tags          :: set(tag),
+                m_body          :: list(part),
+                m_replies       :: list(message)
             )
     ;       excluded_message(
-                em_replies  :: list(message)
+                % Although we will usually have information about excluded
+                % messages now, we often want to act as if they do not exist,
+                % hence the use of a separate constructor.
+                em_id           :: maybe(message_id),
+                em_timestamp    :: maybe(timestamp),
+                em_headers      :: maybe(headers),
+                em_tags         :: maybe(set(tag)),
+                em_replies      :: list(message)
             ).
 
 :- inst message
@@ -83,16 +89,29 @@
 :- type tag
     --->    tag(string).
 
+:- type filename
+    --->    filename(string).
+
+:- type content_disposition
+    --->    content_disposition(string).
+
+:- type content_length
+    --->    content_length(int).
+
+:- type content_transfer_encoding
+    --->    content_transfer_encoding(string).
+
 :- type part
     --->    part(
-                pt_msgid        :: message_id,
-                pt_part         :: maybe(int),
-                pt_type         :: mime_type,
-                pt_content      :: part_content,
-                pt_filename     :: maybe(string),
-                pt_encoding     :: maybe(string),
-                pt_content_len  :: maybe(int),
-                pt_decrypted    :: bool
+                pt_msgid                :: message_id,
+                pt_part                 :: maybe(int), % XXX use bespoke type
+                pt_content_type         :: mime_type,
+                pt_content_disposition  :: maybe(content_disposition),
+                pt_content              :: part_content,
+                pt_filename             :: maybe(filename),
+                pt_content_length       :: maybe(content_length),
+                pt_content_transfer_encoding :: maybe(content_transfer_encoding),
+                pt_decrypted            :: maybe_decrypted
             ).
 
 :- type part_content
@@ -133,9 +152,13 @@
 
 :- type encapsulated_message
     --->    encapsulated_message(
-                em_headers      :: headers,
-                em_body         :: list(part)
+                encap_headers   :: headers,
+                encap_body      :: list(part)
             ).
+
+:- type maybe_decrypted
+    --->    not_decrypted
+    ;       is_decrypted.
 
 %-----------------------------------------------------------------------------%
 
@@ -151,11 +174,14 @@
 
 :- pred tag_to_string(tag::in, string::out) is det.
 
+:- pred non_excluded_message(message).
+:- mode non_excluded_message(ground >> message) is semidet.
+
 :- func get_maybe_message_id(message) = maybe(message_id).
 
-:- func get_timestamp_fallback(message) = timestamp.
+:- func get_timestamp_or_zero(message) = timestamp.
 
-:- func get_subject_fallback(message) = header_value.
+:- func get_maybe_subject(message) = maybe(header_value).
 
 :- func get_replies(message) = list(message).
 
@@ -185,17 +211,48 @@ header_value_string(decoded_unstructured(S)) = S.
 
 tag_to_string(tag(String), String).
 
+non_excluded_message(Message) :-
+    require_complete_switch [Message]
+    (
+        Message = message(_, _, _, _, _, _)
+    ;
+        Message = excluded_message(_, _, _, _, _),
+        fail
+    ).
+
 get_maybe_message_id(message(Id, _, _, _, _, _)) = yes(Id).
-get_maybe_message_id(excluded_message(_)) = no.
+get_maybe_message_id(excluded_message(MaybeId, _, _, _, _)) = MaybeId.
 
-get_timestamp_fallback(message(_, Timestamp, _, _, _, _)) = Timestamp.
-get_timestamp_fallback(excluded_message(_)) = timestamp(0.0).
+get_timestamp_or_zero(Message) = Timestamp :-
+    (
+        Message = message(_, Timestamp, _, _, _, _)
+    ;
+        Message = excluded_message(_, MaybeTimestamp, _, _, _),
+        (
+            MaybeTimestamp = yes(Timestamp)
+        ;
+            MaybeTimestamp = no,
+            Timestamp = timestamp(0.0)
+        )
+    ).
 
-get_subject_fallback(message(_, _, Headers, _, _, _)) = Headers ^ h_subject.
-get_subject_fallback(excluded_message(_)) = header_value("(excluded message)").
+get_maybe_subject(Message) = MaybeSubject :-
+    (
+        Message = message(_, _, Headers, _, _, _),
+        MaybeSubject = yes(Headers ^ h_subject)
+    ;
+        Message = excluded_message(_, _, MaybeHeaders, _, _),
+        (
+            MaybeHeaders = yes(Headers),
+            MaybeSubject = yes(Headers ^ h_subject)
+        ;
+            MaybeHeaders = no,
+            MaybeSubject = no
+        )
+    ).
 
 get_replies(message(_, _, _, _, _, Replies)) = Replies.
-get_replies(excluded_message(Replies)) = Replies.
+get_replies(excluded_message(_, _, _, _, Replies)) = Replies.
 
 %-----------------------------------------------------------------------------%
 % vim: ft=mercury ts=4 sts=4 sw=4 et
