@@ -3088,17 +3088,17 @@ draw_thread_line(TAttrs, Screen, Panel, Line, _LineNr, IsCursor, !IO) :-
     StdTags = standard_tags(Unread, Replied, Deleted, Flagged),
     (
         Unread = unread,
-        draw(Screen, Panel, "📫 ", !IO)
+        draw(Screen, Panel, "📫", !IO)
     ;
         Unread = read,
         draw(Screen, Panel, "  ", !IO)
     ),
     (
         Replied = replied,
-        draw(Screen, Panel, "🖌", !IO)
+        draw(Screen, Panel, "🖌 ", !IO)
     ;
         Replied = not_replied,
-        draw(Screen, Panel, " ", !IO)
+        draw(Screen, Panel, "  ", !IO)
     ),
     (
         Deleted = deleted,

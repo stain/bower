@@ -1894,7 +1894,7 @@ draw_index_line(IAttrs, AuthorWidth, Screen, Panel, Line, _LineNr, IsCursor,
     (
         Unread = unread,
         Base = curs.bold,
-        draw(Screen, Panel, "📫 ", !IO)
+        draw(Screen, Panel, "📫", !IO)
     ;
         Unread = read,
         Base = curs.normal,
@@ -1902,14 +1902,14 @@ draw_index_line(IAttrs, AuthorWidth, Screen, Panel, Line, _LineNr, IsCursor,
     ),
     (
         Replied = replied,
-        draw(Screen, Panel, "🖌", !IO)
+        draw(Screen, Panel, "🖌 ", !IO)
     ;
         Replied = not_replied,
         draw(Screen, Panel, "  ", !IO)
     ),
     (
         Deleted = deleted,
-        draw(Screen, Panel, "✗", !IO)
+        draw(Screen, Panel, "✗ ", !IO)
     ;
         Deleted = not_deleted,
         draw(Screen, Panel, "  ", !IO)
