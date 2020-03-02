@@ -61,7 +61,6 @@
 
 :- import_module bool.
 :- import_module float.
-:- import_module integer.
 :- import_module map.
 :- import_module parsing_utils.
 :- import_module require.
@@ -225,14 +224,14 @@ really_exclude_message(CustomExcludeTags, MessageTags) :-
 parse_message_for_recall(JSON, Message) :-
     (
         JSON/"id" = unesc_string(Id),
-        JSON/"timestamp" = Timestamp0,
-        parse_timestamp(Timestamp0, Timestamp),
+        JSON/"timestamp" = int(TimestampInt),   % Y2038
         JSON/"headers" = map(HeaderMap),
         map.foldl(parse_header, HeaderMap, init_headers, Headers),
         JSON/"tags" = list(TagsList),
         list.map(parse_tag, TagsList, Tags)
     ->
         MessageId = message_id(Id),
+        Timestamp = timestamp(float(TimestampInt)),
         TagSet = set.from_list(Tags),
         Message = message_for_recall(MessageId, Timestamp, Headers, TagSet)
     ;
@@ -420,19 +419,13 @@ parse_signature(JSON, Signature) :-
         ;
             MaybeFingerprint = no
         ),
-        (
-            Created0 = JSON/"created",
-            parse_timestamp(Created0, Created)
-        ->
-            MaybeCreated = yes(Created)
+        ( JSON/"created" = int(Created) ->  % Y2038
+            MaybeCreated = yes(timestamp(float(Created)))
         ;
             MaybeCreated = no
         ),
-        (
-            Expires0 = JSON/"expires",
-            parse_timestamp(Expires0, Expires)
-        ->
-            MaybeExpires = yes(Expires)
+        ( JSON/"expires" = int(Expires) ->  % Y2038
+            MaybeExpires = yes(timestamp(float(Expires)))
         ;
             MaybeExpires = no
         ),
@@ -497,18 +490,17 @@ parse_threads_list(Json, Threads) :-
 parse_thread(Json, Thread) :-
     (
         Json/"thread" = unesc_string(Id),
-        Json/"timestamp" = Timestamp0,
+        Json/"timestamp" = int(Timestamp), % Y2038
         Json/"authors" = unesc_string(Authors),
         Json/"subject" = unesc_string(Subject),
         Json/"tags" = list(TagsList),
         Json/"matched" = int(Matched),
         Json/"total" = int(Total),
-        parse_timestamp(Timestamp0, Timestamp),
         list.map(parse_tag, TagsList, Tags)
     ->
         TagSet = set.from_list(Tags),
-        Thread = thread(thread_id(Id), Timestamp, Authors, Subject, TagSet,
-            Matched, Total)
+        Thread = thread(thread_id(Id), timestamp(float(Timestamp)), Authors,
+            Subject, TagSet, Matched, Total)
     ;
         notmuch_json_error
     ).
@@ -553,24 +545,6 @@ parse_address_count(Json, Result) :-
         Result = Count - NameAddr
     ;
         notmuch_json_error
-    ).
-
-%-----------------------------------------------------------------------------%
-
-:- pred parse_timestamp(json::in, timestamp::out) is semidet.
-
-parse_timestamp(Json, Timestamp) :-
-    (
-        Json = int(Int),
-        % XXX At the time of writing, notmuch returns negative values for
-        % timestamps beyond Y2038 even on platforms where time_t is 64-bits.
-        Timestamp = timestamp(float(Int))
-    ;
-        Json = integer(Integer),
-        % XXX integer.to_int will fail on timestamps beyond 2038 on 32-bit
-        % platforms. This case is currently unreachable in practice.
-        integer.to_int(Integer, Int),
-        Timestamp = timestamp(float(Int))
     ).
 
 %-----------------------------------------------------------------------------%
