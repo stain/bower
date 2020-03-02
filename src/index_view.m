@@ -41,8 +41,6 @@
 :- import_module color.
 :- import_module compose.
 :- import_module cord_util.
-:- import_module curs.
-:- import_module curs.panel.
 :- import_module data.
 :- import_module pipe_to.
 :- import_module poll_notify.
@@ -56,6 +54,8 @@
 :- import_module thread_pager.
 :- import_module time_util.
 :- import_module view_async.
+
+:- use_module curs.
 
 %-----------------------------------------------------------------------------%
 
@@ -72,6 +72,7 @@
                 i_poll_count        :: int,
                 i_internal_search   :: maybe(string),
                 i_internal_search_dir :: search_direction,
+                i_show_authors      :: show_authors,
                 i_common_history    :: common_history
             ).
 
@@ -92,6 +93,10 @@
 :- type selected
     --->    not_selected
     ;       selected.
+
+:- type show_authors
+    --->    show_authors
+    ;       hide_authors.
 
 :- type binding
     --->    scroll_down
@@ -123,6 +128,7 @@
     ;       unselect_all
     ;       bulk_tag(keep_selection)
     ;       pipe_thread_id
+    ;       toggle_show_authors
     ;       quit.
 
 :- type action
@@ -206,7 +212,7 @@ open_index(Config, NotmuchConfig, Crypto, Screen, SearchString,
     MaybeSearch = no,
     IndexInfo = index_info(Config, Crypto, Scrollable, SearchString,
         SearchTokens, SearchTime, NextPollTime, PollCount, MaybeSearch,
-        dir_forward, !.CommonHistory),
+        dir_forward, show_authors, !.CommonHistory),
     index_loop(Screen, redraw, IndexInfo, !IO).
 
 :- pred search_terms_with_progress(prog_config::in, screen::in,
@@ -310,14 +316,15 @@ index_loop(Screen, OnEntry, !.IndexInfo, !IO) :-
         OnEntry = redraw,
         draw_index_view(Screen, !.IndexInfo, !IO),
         draw_index_bar(Screen, !.IndexInfo, !IO),
-        panel.update_panels(!IO)
+        update_panels(Screen, !IO)
     ;
         OnEntry = no_draw
     ),
 
     poll_async_with_progress(Screen, handle_poll_result, !IndexInfo, !IO),
     get_keycode_async_aware(!.IndexInfo ^ i_next_poll_time, KeyCode, !IO),
-    index_view_input(Screen, KeyCode, MessageUpdate, Action, !IndexInfo),
+    get_main_rows(Screen, NumMainRows, !IO),
+    index_view_input(NumMainRows, KeyCode, MessageUpdate, Action, !IndexInfo),
     update_message(Screen, MessageUpdate, !IO),
 
     (
@@ -330,9 +337,9 @@ index_loop(Screen, OnEntry, !.IndexInfo, !IO) :-
         index_loop(Screen, no_draw, !.IndexInfo, !IO)
     ;
         Action = resize,
-        replace_screen_for_resize(Screen, NewScreen, !IO),
-        recreate_screen(NewScreen, !IndexInfo),
-        index_loop(NewScreen, redraw, !.IndexInfo, !IO)
+        recreate_screen_for_resize(Screen, !IO),
+        recreate_index_view(Screen, !IndexInfo, !IO),
+        index_loop(Screen, redraw, !.IndexInfo, !IO)
     ;
         Action = open_pager(ThreadId, IncludeTags),
         flush_async_with_progress(Screen, !IO),
@@ -352,11 +359,11 @@ index_loop(Screen, OnEntry, !.IndexInfo, !IO) :-
         open_thread_pager(Config, Crypto, Screen, ThreadId, IncludeTags,
             IndexPollTerms, MaybeSearch, Transition,
             CommonHistory0, CommonHistory, !IO),
-        handle_screen_transition(Screen, NewScreen, Transition,
-            TagUpdates, !IndexInfo, !IO),
+        handle_screen_transition(Screen, Transition, TagUpdates,
+            !IndexInfo, !IO),
         effect_thread_pager_changes(TagUpdates, !IndexInfo, !IO),
         !IndexInfo ^ i_common_history := CommonHistory,
-        index_loop(NewScreen, redraw, !.IndexInfo, !IO)
+        index_loop(Screen, redraw, !.IndexInfo, !IO)
     ;
         Action = enter_limit(MaybeInitial),
         Config = !.IndexInfo ^ i_config,
@@ -421,38 +428,36 @@ index_loop(Screen, OnEntry, !.IndexInfo, !IO) :-
         CommonHistory1 = CommonHistory0 ^ ch_to_history := ToHistory,
         CommonHistory = CommonHistory1 ^ ch_subject_history := SubjectHistory,
         !IndexInfo ^ i_common_history := CommonHistory,
-        handle_screen_transition(Screen, NewScreen, Transition, Sent,
-            !IndexInfo, !IO),
+        handle_screen_transition(Screen, Transition, Sent, !IndexInfo, !IO),
         (
             Sent = sent,
-            refresh_all(NewScreen, quiet, !IndexInfo, !IO)
+            refresh_all(Screen, quiet, !IndexInfo, !IO)
         ;
             Sent = not_sent
         ),
-        index_loop(NewScreen, redraw, !.IndexInfo, !IO)
+        index_loop(Screen, redraw, !.IndexInfo, !IO)
     ;
         Action = start_reply(ReplyKind),
         flush_async_with_progress(Screen, !IO),
-        start_reply(Screen, NewScreen, ReplyKind, MaybeRefresh,
-            !IndexInfo, !IO),
+        start_reply(Screen, ReplyKind, MaybeRefresh, !IndexInfo, !IO),
         (
             MaybeRefresh = yes(ThreadId),
-            refresh_index_line(NewScreen, ThreadId, !IndexInfo, !IO)
+            refresh_index_line(Screen, ThreadId, !IndexInfo, !IO)
         ;
             MaybeRefresh = no
         ),
-        index_loop(NewScreen, redraw, !.IndexInfo, !IO)
+        index_loop(Screen, redraw, !.IndexInfo, !IO)
     ;
         Action = start_recall,
         flush_async_with_progress(Screen, !IO),
-        handle_recall(Screen, NewScreen, Sent, !IndexInfo, !IO),
+        handle_recall(Screen, Sent, !IndexInfo, !IO),
         (
             Sent = sent,
-            refresh_all(NewScreen, quiet, !IndexInfo, !IO)
+            refresh_all(Screen, quiet, !IndexInfo, !IO)
         ;
             Sent = not_sent
         ),
-        index_loop(NewScreen, redraw, !.IndexInfo, !IO)
+        index_loop(Screen, redraw, !.IndexInfo, !IO)
     ;
         Action = addressbook_add,
         addressbook_add(Screen, !.IndexInfo, !IO),
@@ -508,56 +513,52 @@ index_loop(Screen, OnEntry, !.IndexInfo, !IO) :-
 
 %-----------------------------------------------------------------------------%
 
-:- pred index_view_input(screen::in, keycode::in, message_update::out,
+:- pred index_view_input(int::in, keycode::in, message_update::out,
     action::out, index_info::in, index_info::out) is det.
 
-index_view_input(Screen, KeyCode, MessageUpdate, Action, !IndexInfo) :-
+index_view_input(NumRows, KeyCode, MessageUpdate, Action, !IndexInfo) :-
     ( key_binding(KeyCode, Binding) ->
         (
             Binding = scroll_down,
-            move_cursor(Screen, 1, MessageUpdate, !IndexInfo),
+            move_cursor(NumRows, 1, MessageUpdate, !IndexInfo),
             Action = continue
         ;
             Binding = scroll_up,
-            move_cursor(Screen, -1, MessageUpdate, !IndexInfo),
+            move_cursor(NumRows, -1, MessageUpdate, !IndexInfo),
             Action = continue
         ;
             Binding = page_down,
-            get_main_rows(Screen, NumRows),
-            move_cursor(Screen, NumRows - 1, MessageUpdate, !IndexInfo),
+            move_cursor(NumRows, NumRows - 1, MessageUpdate, !IndexInfo),
             Action = continue
         ;
             Binding = page_up,
-            get_main_rows(Screen, NumRows),
-            move_cursor(Screen, -NumRows + 1, MessageUpdate, !IndexInfo),
+            move_cursor(NumRows, -NumRows + 1, MessageUpdate, !IndexInfo),
             Action = continue
         ;
             Binding = half_page_down,
-            get_main_rows(Screen, NumRows),
             Delta = int.max(15, NumRows / 2),
-            move_cursor(Screen, Delta, MessageUpdate, !IndexInfo),
+            move_cursor(NumRows, Delta, MessageUpdate, !IndexInfo),
             Action = continue
         ;
             Binding = half_page_up,
-            get_main_rows(Screen, NumRows),
             Delta = int.max(15, NumRows / 2),
-            move_cursor(Screen, -Delta, MessageUpdate, !IndexInfo),
+            move_cursor(NumRows, -Delta, MessageUpdate, !IndexInfo),
             Action = continue
         ;
             Binding = home,
             Scrollable0 = !.IndexInfo ^ i_scrollable,
             NumLines = get_num_lines(Scrollable0),
-            move_cursor(Screen, -NumLines, MessageUpdate, !IndexInfo),
+            move_cursor(NumRows, -NumLines, MessageUpdate, !IndexInfo),
             Action = continue
         ;
             Binding = end,
             Scrollable0 = !.IndexInfo ^ i_scrollable,
             NumLines = get_num_lines(Scrollable0),
-            move_cursor(Screen, NumLines, MessageUpdate, !IndexInfo),
+            move_cursor(NumRows, NumLines, MessageUpdate, !IndexInfo),
             Action = continue
         ;
             Binding = skip_to_unread,
-            skip_to_unread(Screen, MessageUpdate, !IndexInfo),
+            skip_to_unread(NumRows, MessageUpdate, !IndexInfo),
             Action = continue
         ;
             Binding = enter,
@@ -597,7 +598,7 @@ index_view_input(Screen, KeyCode, MessageUpdate, Action, !IndexInfo) :-
             Action = prompt_internal_search(SearchDir)
         ;
             Binding = skip_to_internal_search,
-            skip_to_internal_search(Screen, MessageUpdate, !IndexInfo),
+            skip_to_internal_search(NumRows, MessageUpdate, !IndexInfo),
             Action = continue
         ;
             Binding = toggle_unread,
@@ -625,7 +626,7 @@ index_view_input(Screen, KeyCode, MessageUpdate, Action, !IndexInfo) :-
             Action = prompt_tag(Initial)
         ;
             Binding = toggle_select,
-            toggle_select(Screen, MessageUpdate, !IndexInfo),
+            toggle_select(NumRows, MessageUpdate, !IndexInfo),
             Action = continue
         ;
             Binding = unselect_all,
@@ -640,12 +641,16 @@ index_view_input(Screen, KeyCode, MessageUpdate, Action, !IndexInfo) :-
             MessageUpdate = no_change,
             Action = pipe_thread_id
         ;
+            Binding = toggle_show_authors,
+            toggle_show_authors(MessageUpdate, !IndexInfo),
+            Action = continue
+        ;
             Binding = quit,
             MessageUpdate = no_change,
             Action = quit
         )
     ;
-        ( KeyCode = code(key_resize) ->
+        ( KeyCode = code(curs.key_resize) ->
             Action = resize
         ; KeyCode = timeout_or_error ->
             Action = continue_no_draw
@@ -660,17 +665,17 @@ index_view_input(Screen, KeyCode, MessageUpdate, Action, !IndexInfo) :-
 key_binding(char(Char), Binding) :-
     key_binding_char(Char, Binding).
 key_binding(code(Code), Binding) :-
-    ( Code = key_up ->
+    ( Code = curs.key_up ->
         Binding = scroll_up
-    ; Code = key_down ->
+    ; Code = curs.key_down ->
         Binding = scroll_down
-    ; Code = key_home ->
+    ; Code = curs.key_home ->
         Binding = home
-    ; Code = key_end ->
+    ; Code = curs.key_end ->
         Binding = end
-    ; Code = key_pageup ->
+    ; Code = curs.key_pageup ->
         Binding = page_up
-    ; Code = key_pagedown ->
+    ; Code = curs.key_pagedown ->
         Binding = page_down
     ;
         fail
@@ -711,15 +716,15 @@ key_binding_char('T', unselect_all).
 key_binding_char('''', bulk_tag(clear_selection)).
 key_binding_char('"', bulk_tag(keep_selection)).
 key_binding_char('|', pipe_thread_id).
+key_binding_char('z', toggle_show_authors).
 key_binding_char('q', quit).
 
-:- pred move_cursor(screen::in, int::in, message_update::out,
+:- pred move_cursor(int::in, int::in, message_update::out,
     index_info::in, index_info::out) is det.
 
-move_cursor(Screen, Delta, MessageUpdate, !Info) :-
+move_cursor(MainRows, Delta, MessageUpdate, !Info) :-
     Scrollable0 = !.Info ^ i_scrollable,
-    get_main_rows(Screen, NumRows),
-    move_cursor(NumRows, Delta, HitLimit, Scrollable0, Scrollable),
+    move_cursor(MainRows, Delta, HitLimit, Scrollable0, Scrollable),
     !Info ^ i_scrollable := Scrollable,
     (
         HitLimit = no,
@@ -733,12 +738,11 @@ move_cursor(Screen, Delta, MessageUpdate, !Info) :-
         )
     ).
 
-:- pred skip_to_unread(screen::in, message_update::out,
+:- pred skip_to_unread(int::in, message_update::out,
     index_info::in, index_info::out) is det.
 
-skip_to_unread(Screen, MessageUpdate, !Info) :-
+skip_to_unread(NumRows, MessageUpdate, !Info) :-
     Scrollable0 = !.Info ^ i_scrollable,
-    get_main_rows(Screen, NumRows),
     ( get_cursor(Scrollable0, Cursor0) ->
         (
             search_forward(is_unread_line, Scrollable0, Cursor0 + 1, Cursor, _)
@@ -801,15 +805,14 @@ effect_thread_pager_changes(Effects, !Info, !IO) :-
 
 %-----------------------------------------------------------------------------%
 
-:- pred start_reply(screen::in, screen::out, reply_kind::in,
-    maybe(thread_id)::out, index_info::in, index_info::out, io::di, io::uo)
-    is det.
+:- pred start_reply(screen::in, reply_kind::in, maybe(thread_id)::out,
+    index_info::in, index_info::out, io::di, io::uo) is det.
 
-start_reply(!Screen, ReplyKind, MaybeRefresh, !Info, !IO) :-
+start_reply(Screen, ReplyKind, MaybeRefresh, !Info, !IO) :-
     Scrollable = !.Info ^ i_scrollable,
     ( get_cursor_line(Scrollable, _, CursorLine) ->
         ThreadId = CursorLine ^ i_id,
-        try_reply(!Screen, ThreadId, no, ReplyKind, TryResA, !Info, !IO),
+        try_reply(Screen, ThreadId, no, ReplyKind, TryResA, !Info, !IO),
         (
             TryResA = ok(sent),
             MaybeRefresh = yes(ThreadId)
@@ -818,7 +821,7 @@ start_reply(!Screen, ReplyKind, MaybeRefresh, !Info, !IO) :-
             MaybeRefresh = no
         ;
             TryResA = unable_to_choose,
-            try_reply(!Screen, ThreadId, yes, ReplyKind, TryResB, !Info, !IO),
+            try_reply(Screen, ThreadId, yes, ReplyKind, TryResB, !Info, !IO),
             (
                 TryResB = ok(sent),
                 MaybeRefresh = yes(ThreadId)
@@ -828,7 +831,7 @@ start_reply(!Screen, ReplyKind, MaybeRefresh, !Info, !IO) :-
             ;
                 TryResB = unable_to_choose,
                 Msg = "Unable to choose message to reply to.",
-                update_message(!.Screen, set_warning(Msg), !IO),
+                update_message(Screen, set_warning(Msg), !IO),
                 MaybeRefresh = no
             ;
                 TryResB = error,
@@ -839,15 +842,15 @@ start_reply(!Screen, ReplyKind, MaybeRefresh, !Info, !IO) :-
             MaybeRefresh = no
         )
     ;
-        update_message(!.Screen, set_warning("No thread."), !IO),
+        update_message(Screen, set_warning("No thread."), !IO),
         MaybeRefresh = no
     ).
 
-:- pred try_reply(screen::in, screen::out, thread_id::in, bool::in,
-    reply_kind::in, try_reply_result::out, index_info::in, index_info::out,
-    io::di, io::uo) is det.
+:- pred try_reply(screen::in, thread_id::in, bool::in, reply_kind::in,
+    try_reply_result::out, index_info::in, index_info::out, io::di, io::uo)
+    is det.
 
-try_reply(!Screen, ThreadId, RequireUnread, ReplyKind, Res, !Info, !IO) :-
+try_reply(Screen, ThreadId, RequireUnread, ReplyKind, Res, !Info, !IO) :-
     (
         RequireUnread = yes,
         Args0 = ["tag:unread"]
@@ -871,37 +874,37 @@ try_reply(!Screen, ThreadId, RequireUnread, ReplyKind, Res, !Info, !IO) :-
     (
         ListRes = ok(MessageIds),
         ( MessageIds = [MessageId] ->
-            start_reply_to_message_id(Config, Crypto, !.Screen, MessageId,
+            start_reply_to_message_id(Config, Crypto, Screen, MessageId,
                 ReplyKind, Transition, !IO),
-            handle_screen_transition(!Screen, Transition, Sent, !Info, !IO),
+            handle_screen_transition(Screen, Transition, Sent, !Info, !IO),
             Res = ok(Sent)
         ;
             Res = unable_to_choose
         )
     ;
         ListRes = error(Error),
-        update_message(!.Screen, set_warning(Error), !IO),
+        update_message(Screen, set_warning(Error), !IO),
         Res = error
     ).
 
 %-----------------------------------------------------------------------------%
 
-:- pred handle_recall(screen::in, screen::out, sent::out,
-    index_info::in, index_info::out, io::di, io::uo) is det.
+:- pred handle_recall(screen::in, sent::out, index_info::in, index_info::out,
+    io::di, io::uo) is det.
 
-handle_recall(!Screen, Sent, !IndexInfo, !IO) :-
+handle_recall(Screen, Sent, !IndexInfo, !IO) :-
     Config = !.IndexInfo ^ i_config,
     Crypto = !.IndexInfo ^ i_crypto,
-    select_recall(Config, !.Screen, no, TransitionA, !IO),
-    handle_screen_transition(!Screen, TransitionA, MaybeSelected,
+    select_recall(Config, Screen, no, TransitionA, !IO),
+    handle_screen_transition(Screen, TransitionA, MaybeSelected,
         !IndexInfo, !IO),
     (
         MaybeSelected = yes(Message),
         (
             Message = message(_, _, _, _, _, _),
-            continue_from_message(Config, Crypto, !.Screen, postponed_message,
+            continue_from_message(Config, Crypto, Screen, postponed_message,
                 Message, TransitionB, !IO),
-            handle_screen_transition(!Screen, TransitionB, Sent, !IndexInfo,
+            handle_screen_transition(Screen, TransitionB, Sent, !IndexInfo,
                 !IO)
         ;
             Message = excluded_message(_, _, _, _, _),
@@ -968,24 +971,24 @@ prompt_internal_search(Screen, SearchDir, !Info, !IO) :-
             !Info ^ i_internal_search := yes(Search),
             !Info ^ i_internal_search_dir := SearchDir,
             !Info ^ i_common_history ^ ch_internal_search_history := History,
-            skip_to_internal_search(Screen, MessageUpdate, !Info),
+            get_main_rows(Screen, NumRows, !IO),
+            skip_to_internal_search(NumRows, MessageUpdate, !Info),
             update_message(Screen, MessageUpdate, !IO)
         )
     ;
         Return = no
     ).
 
-:- pred skip_to_internal_search(screen::in, message_update::out,
+:- pred skip_to_internal_search(int::in, message_update::out,
     index_info::in, index_info::out) is det.
 
-skip_to_internal_search(Screen, MessageUpdate, !Info) :-
+skip_to_internal_search(NumRows, MessageUpdate, !Info) :-
     MaybeSearch = !.Info ^ i_internal_search,
     (
         MaybeSearch = yes(Search),
         SearchDir = !.Info ^ i_internal_search_dir,
         Scrollable0 = !.Info ^ i_scrollable,
         ( get_cursor(Scrollable0, Cursor0) ->
-            get_main_rows(Screen, NumRows),
             (
                 SearchDir = dir_forward,
                 Start = Cursor0 + 1,
@@ -1063,7 +1066,8 @@ modify_tag_cursor_line(ModifyPred, Screen, !Info, !IO) :-
             async_tag_threads(Config, TagDeltas, [ThreadId], !IO),
             set_cursor_line(CursorLine, Scrollable0, Scrollable),
             !Info ^ i_scrollable := Scrollable,
-            move_cursor(Screen, 1, _MessageUpdate, !Info),
+            get_main_rows(Screen, NumRows, !IO),
+            move_cursor(NumRows, 1, _MessageUpdate, !Info),
             MessageUpdate = clear_message
         ;
             MessageUpdate = set_warning("Refusing to tag multiple messages.")
@@ -1241,10 +1245,10 @@ apply_tag_changes(CursorLine0, TagDeltas, AddTags, RemoveTags, !Info, !IO) :-
 
 %-----------------------------------------------------------------------------%
 
-:- pred toggle_select(screen::in, message_update::out,
+:- pred toggle_select(int::in, message_update::out,
     index_info::in, index_info::out) is det.
 
-toggle_select(Screen, MessageUpdate, !Info) :-
+toggle_select(NumRows, MessageUpdate, !Info) :-
     Scrollable0 = !.Info ^ i_scrollable,
     ( get_cursor_line(Scrollable0, _Cursor0, CursorLine0) ->
         Selected0 = CursorLine0 ^ i_selected,
@@ -1258,7 +1262,7 @@ toggle_select(Screen, MessageUpdate, !Info) :-
         CursorLine = CursorLine0 ^ i_selected := Selected,
         set_cursor_line(CursorLine, Scrollable0, Scrollable),
         !Info ^ i_scrollable := Scrollable,
-        move_cursor(Screen, 1, MessageUpdate, !Info)
+        move_cursor(NumRows, 1, MessageUpdate, !Info)
     ;
         MessageUpdate = set_warning("No thread.")
     ).
@@ -1595,6 +1599,24 @@ selected_line_thread_id(Line, ThreadId) :-
 
 %-----------------------------------------------------------------------------%
 
+:- pred toggle_show_authors(message_update::out,
+    index_info::in, index_info::out) is det.
+
+toggle_show_authors(MessageUpdate, !Info) :-
+    ShowAuthors0 = !.Info ^ i_show_authors,
+    (
+        ShowAuthors0 = show_authors,
+        MessageUpdate = set_info("Hiding authors."),
+        ShowAuthors = hide_authors
+    ;
+        ShowAuthors0 = hide_authors,
+        MessageUpdate = set_info("Showing authors."),
+        ShowAuthors = show_authors
+    ),
+    !Info ^ i_show_authors := ShowAuthors.
+
+%-----------------------------------------------------------------------------%
+
 :- pred refresh_all(screen::in, verbosity::in, index_info::in, index_info::out,
     io::di, io::uo) is det.
 
@@ -1647,7 +1669,7 @@ refresh_all_2(Screen, Time, Tokens, Threads, !Info, !IO) :-
                 search_forward(line_matches_thread_id(ThreadId0),
                     !.Scrollable, 0, Cursor, _)
             ->
-                get_main_rows(Screen, NumRows),
+                get_main_rows(Screen, NumRows, !IO),
                 set_cursor_visible(Cursor, NumRows, !Scrollable)
             ;
                 true
@@ -1703,33 +1725,27 @@ replace_index_cursor_line(Nowish, Thread, !Info, !IO) :-
 
 %-----------------------------------------------------------------------------%
 
-:- pred recreate_screen(screen::in, index_info::in, index_info::out) is det.
+:- pred recreate_index_view(screen::in, index_info::in, index_info::out,
+    io::di, io::uo) is det.
 
-recreate_screen(Screen, !IndexInfo) :-
+recreate_index_view(Screen, !IndexInfo, !IO) :-
     % Keep cursor visible.
     Scrollable0 = !.IndexInfo ^ i_scrollable,
     ( get_cursor(Scrollable0, Cursor) ->
-        get_main_rows(Screen, NumRows),
+        get_main_rows(Screen, NumRows, !IO),
         set_cursor_visible(Cursor, NumRows, Scrollable0, Scrollable),
         !IndexInfo ^ i_scrollable := Scrollable
     ;
         true
     ).
 
-:- pred handle_screen_transition(screen::in, screen::out,
-    screen_transition(T)::in, T::out, index_info::in, index_info::out,
-    io::di, io::uo) is det.
+:- pred handle_screen_transition(screen::in, screen_transition(T)::in, T::out,
+    index_info::in, index_info::out, io::di, io::uo) is det.
 
-handle_screen_transition(!Screen, Transition, T, !Info, !IO) :-
+handle_screen_transition(Screen, Transition, T, !Info, !IO) :-
     Transition = screen_transition(T, MessageUpdate),
-    fast_forward_screen(!Screen, Resized, !IO),
-    (
-        Resized = yes,
-        recreate_screen(!.Screen, !Info)
-    ;
-        Resized = no
-    ),
-    update_message(!.Screen, MessageUpdate, !IO).
+    recreate_index_view(Screen, !Info, !IO),    % in case of resize
+    update_message(Screen, MessageUpdate, !IO).
 
 %-----------------------------------------------------------------------------%
 
@@ -1788,7 +1804,7 @@ handle_poll_result(Screen, CountOutput, !Info, !IO) :-
             !Info ^ i_poll_count := Count,
             % Redraw the bar immediately.
             draw_index_bar(Screen, !.Info, !IO),
-            panel.update_panels(!IO),
+            update_panels(Screen, !IO),
 
             % Run notify command if any.
             ( Count > 0 ->
@@ -1824,11 +1840,18 @@ next_poll_time(Config, Time) = NextPollTime :-
 draw_index_view(Screen, Info, !IO) :-
     Config = Info ^ i_config,
     Attrs = index_attrs(Config),
-    get_cols(Screen, Cols),
-    get_author_width(Cols, AuthorWidth),
-    get_main_panels(Screen, MainPanels),
+    ShowAuthors = Info ^ i_show_authors,
+    (
+        ShowAuthors = show_authors,
+        get_cols(Screen, Cols, !IO),
+        get_author_width(Cols, AuthorWidth)
+    ;
+        ShowAuthors = hide_authors,
+        AuthorWidth = 0
+    ),
+    get_main_panels(Screen, MainPanels, !IO),
     Scrollable = Info ^ i_scrollable,
-    scrollable.draw(draw_index_line(Attrs, AuthorWidth), MainPanels,
+    scrollable.draw(draw_index_line(Attrs, AuthorWidth), Screen, MainPanels,
         Scrollable, !IO).
 
 :- pred get_author_width(int::in, int::out) is det.
@@ -1841,10 +1864,11 @@ get_author_width(Cols, AuthorWidth) :-
         AuthorWidth = min(Rem, 20)
     ).
 
-:- pred draw_index_line(index_attrs::in, int::in, panel::in, index_line::in,
-    int::in, bool::in, io::di, io::uo) is det.
+:- pred draw_index_line(index_attrs::in, int::in, screen::in, vpanel::in,
+    index_line::in, int::in, bool::in, io::di, io::uo) is det.
 
-draw_index_line(IAttrs, AuthorWidth, Panel, Line, _LineNr, IsCursor, !IO) :-
+draw_index_line(IAttrs, AuthorWidth, Screen, Panel, Line, _LineNr, IsCursor,
+        !IO) :-
     Line = index_line(_Id, Selected, Date, Authors, Subject, Tags, StdTags,
         NonstdTagsWidth, Matched, Total),
     Attrs = IAttrs ^ i_generic,
@@ -1855,92 +1879,99 @@ draw_index_line(IAttrs, AuthorWidth, Panel, Line, _LineNr, IsCursor, !IO) :-
         IsCursor = no,
         DateAttr = Attrs ^ relative_date
     ),
-    draw_fixed(Panel, DateAttr, 10, Date, ' ', !IO),
+    draw_fixed(Screen, Panel, DateAttr, 10, Date, ' ', !IO),
 
     (
         Selected = selected,
-        mattr_draw(Panel, unless(IsCursor, Attrs ^ selected), "✓ ", !IO)
+        mattr_draw(Screen, Panel, unless(IsCursor, Attrs ^ selected), "✓ ", !IO)
     ;
         Selected = not_selected,
-        draw(Panel, "  ", !IO)
+        draw(Screen, Panel, " ", !IO)
     ),
-    mattr(Panel, unless(IsCursor, Attrs ^ standard_tag), !IO),
+    mattr(Screen, Panel, unless(IsCursor, Attrs ^ standard_tag), !IO),
 
     StdTags = standard_tags(Unread, Replied, Deleted, Flagged),
     (
         Unread = unread,
-        Base = bold,
-        draw(Panel, "📫 ", !IO)
+        Base = curs.bold,
+        draw(Screen, Panel, "📫 ", !IO)
     ;
         Unread = read,
-        Base = normal,
-        draw(Panel, "  ", !IO)
+        Base = curs.normal,
+        draw(Screen, Panel, "  ", !IO)
     ),
     (
         Replied = replied,
-        draw(Panel, "🖌", !IO)
+        draw(Screen, Panel, "🖌", !IO)
     ;
         Replied = not_replied,
-        draw(Panel, " ", !IO)
+        draw(Screen, Panel, "  ", !IO)
     ),
     (
         Deleted = deleted,
-        draw(Panel, "✗", !IO)
+        draw(Screen, Panel, "✗", !IO)
     ;
         Deleted = not_deleted,
-        draw(Panel, " ", !IO)
+        draw(Screen, Panel, "  ", !IO)
     ),
     (
         Flagged = flagged,
-        mattr_draw(Panel, unless(IsCursor, Attrs ^ flagged), "⚐ ", !IO)
+        mattr_draw(Screen, Panel, unless(IsCursor, Attrs ^ flagged), "⚐ ", !IO)
     ;
         Flagged = unflagged,
-        draw(Panel, "  ", !IO)
+        draw(Screen, Panel, "  ", !IO)
     ),
 
     ( AuthorWidth > 0 ->
-        mattr_draw_fixed(Panel, unless(IsCursor, Attrs ^ author + Base),
+        mattr_draw_fixed(Screen, Panel,
+            unless(IsCursor, curs.(Attrs ^ author + Base)),
             AuthorWidth, Authors, ' ', !IO)
     ;
         true
     ),
 
     ( Matched = Total ->
-        CountStr = format(" %3d     ", [i(Total)])
+        CountStr = format(" %3d", [i(Total)]),
+        TotalStr = "     "
     ;
-        CountStr = format(" %3d/%-3d ", [i(Matched), i(Total)])
+        CountStr = format(" %3d", [i(Matched)]),
+        TotalStr = format("/%-3d ", [i(Total)])
     ),
-    mattr_draw(Panel, unless(IsCursor, IAttrs ^ i_count), CountStr, !IO),
+    mattr_draw(Screen, Panel, unless(IsCursor, IAttrs ^ i_count), CountStr,
+        !IO),
+    mattr_draw(Screen, Panel, unless(IsCursor, IAttrs ^ i_total), TotalStr,
+        !IO),
 
-    panel.getyx(Panel, Row, SubjectX0, !IO),
-    mattr_draw(Panel, unless(IsCursor, Attrs ^ subject), Subject, !IO),
+    getyx(Screen, Panel, Row, SubjectX0, !IO),
+    mattr_draw(Screen, Panel, unless(IsCursor, Attrs ^ subject), Subject, !IO),
 
     % Draw non-standard tags, overlapping up to half of the subject.
     ( NonstdTagsWidth > 0 ->
-        panel.getyx(Panel, _, SubjectX, !IO),
-        panel.getmaxyx(Panel, _, MaxX, !IO),
+        getyx(Screen, Panel, _, SubjectX, !IO),
+        getmaxyx(Screen, Panel, _, MaxX, !IO),
         (
             MaxX - SubjectX < NonstdTagsWidth,
             SubjectMidX = (MaxX + SubjectX0)/2,
             MoveX = max(SubjectMidX, MaxX - NonstdTagsWidth),
             MoveX < SubjectX
         ->
-            panel.move(Panel, Row, MoveX, !IO)
+            move(Screen, Panel, Row, MoveX, !IO)
         ;
             true
         ),
-        attr(Panel, Attrs ^ other_tag, !IO),
-        set.fold(draw_display_tag(Panel), Tags, !IO)
+        attr(Screen, Panel, Attrs ^ other_tag, !IO),
+        set.fold(draw_display_tag(Screen, Panel), Tags, !IO)
     ;
         true
     ).
 
-:- pred draw_display_tag(panel::in, tag::in, io::di, io::uo) is det.
+:- pred draw_display_tag(screen::in, vpanel::in, tag::in, io::di, io::uo)
+    is det.
 
-draw_display_tag(Panel, Tag, !IO) :-
+draw_display_tag(Screen, Panel, Tag, !IO) :-
     ( display_tag(Tag) ->
         Tag = tag(TagName),
-        draw2(Panel, " ", TagName, !IO)
+        draw2(Screen, Panel, " ", TagName, !IO)
     ;
         true
     ).
@@ -1961,7 +1992,7 @@ draw_index_bar(Screen, Info, !IO) :-
 count_messages_since_refresh(Count) =
     string.format("%+d messages since refresh", [i(Count)]).
 
-:- func unless(bool, attr) = maybe(attr).
+:- func unless(bool, curs.attr) = maybe(curs.attr).
 
 unless(no, X) = yes(X).
 unless(yes, _) = no.
